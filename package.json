@@ -1,0 +1,63 @@
+{
+  "name": "dsh-effort-router",
+  "version": "0.3.0",
+  "description": "按任务难度调整当前模型的思考强度，provider 与 model 保持用户所选",
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./user": "./user/index.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json",
+    "./locale/*.json": "./locale/*.json"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "user",
+    "cordis.patch.yml",
+    "locale",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=18",
+    "dsh": ">=0.2.0-rc.2"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web"
+    }
+  },
+  "peerDependencies": {
+    "@deepseek-ai/schemastery": "~3.18.4"
+  },
+  "dependencies": {
+    "dsh-router-laya": "^2.2.1"
+  },
+  "scripts": {
+    "test": "node test/effort.test.mjs && node test/apply.test.mjs && node test/mirror.test.mjs && node test/provision.test.mjs && node test/health.test.mjs && node test/config.test.mjs && node test/cache.test.mjs && node test/user.test.mjs",
+    "test:cordis": "node test/cordis.test.mjs",
+    "prepublishOnly": "npm test"
+  },
+  "keywords": [
+    "dsh-plugin",
+    "deepseek-harness",
+    "reasoning-effort",
+    "model-router"
+  ],
+  "license": "MIT",
+  "author": "YG",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/YOUR_GITHUB_USER/dsh-effort-router.git"
+  },
+  "bugs": {
+    "url": "https://github.com/YOUR_GITHUB_USER/dsh-effort-router/issues"
+  },
+  "homepage": "https://github.com/YOUR_GITHUB_USER/dsh-effort-router#readme"
+}

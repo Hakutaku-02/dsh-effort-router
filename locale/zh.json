@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "难度路由",
+    "description": "按每轮任务的难度选思考强度，provider 与 model 保持模型选择器里的那个。"
+  }
+}

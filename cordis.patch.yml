@@ -1,0 +1,13 @@
+# dsh-effort-router 的默认挂载行。改配置请改 profile 的 cordis.patch.yml。
+# 新行必须用 insert：裸的 - id: 只在目标行已存在时才生效。
+- insert:
+    - id: effort-router
+      name: dsh-effort-router
+      config:
+        mode: auto
+        judgeUrl: http://127.0.0.1:8765/judge
+        tiers:
+          low: low
+          high: high
+          max: max
+          fallback: low

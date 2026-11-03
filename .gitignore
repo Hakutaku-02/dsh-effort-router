@@ -1,0 +1,17 @@
+node_modules/
+*.log
+
+# 本地参考用的会话导出，不进仓库
+sessions/
+recovered/
+
+.DS_Store
+Thumbs.db
+.idea/
+
+# 打包产物
+*.tgz
+
+# API与Key
+.env/
+

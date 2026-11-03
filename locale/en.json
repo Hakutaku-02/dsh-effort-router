@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Effort Router",
+    "description": "Pick reasoningEffort each turn from a local difficulty judge; provider and model stay as you selected them."
+  }
+}
