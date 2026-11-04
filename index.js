@@ -13,7 +13,7 @@
 
 import { spawn } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
-import { appendFileSync, closeSync, cpSync, existsSync, mkdirSync, openSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
+import { appendFileSync, closeSync, cpSync, existsSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import { homedir, tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -39,7 +39,9 @@ const MODES = ['auto', 'manual']
 const TIER_KEYS = ['low', 'high', 'max', 'fallback']
 const DEFAULT_TIERS = { low: 'low', high: 'high', max: 'max', fallback: 'low' }
 /** 最近判定的保留条数。落盘和芯片列表都用它。 */
-const MAX_RECENT = 50
+const MAX_RECENT = 100
+/** 档位没变化时，最多这么久也刷一次盘。 */
+const SAVE_INTERVAL_MS = 60000
 /** 查询参数的长度上限。端点名与模型名都很短，超长的一律当非法。 */
 const MAX_QUERY_LENGTH = 200
 /** 模型档位缓存的容量上限，防止外部传入的端点名把这张表撑大。 */
@@ -366,14 +368,19 @@ function recentPath() {
   return join(provisionRoot(), 'last.json')
 }
 
-/**
- * 会话 id 的归一化。
+/** 会话 id 的归一化。
  *
  * 宿主侧的 session.id 带 `session-` 前缀，前端 `sessionId` 有时给裸 uuid。
  * 两边都归一化再比，芯片才能精确对上自己的会话。
  */
 function bareSession(value) {
   return String(value ?? '').replace(/^session-/, '')
+}
+
+/** 轮次号：payload 里没有、或者不是数字时给 undefined，免得去重逻辑把两轮误判成同一轮。 */
+function turnOf(payload) {
+  const turn = payload !== null && payload !== undefined ? payload.turn : undefined
+  return typeof turn === 'number' ? turn : undefined
 }
 
 /** 读回上次落盘的判定。文件不存在、坏掉、结构不对都当空表；只留最新的 limit 条。 */
@@ -395,31 +402,51 @@ function loadRecent(limit) {
 /**
  * 把最近判定写回磁盘，只留最近几条。
  *
- * 三处细节都是为了多个进程共存时不互相踩：
- * 1. 先读回磁盘再合并，各进程只补自己新写的行，不整表覆盖对方的记录；
- * 2. 临时文件名带 pid 与随机后缀，两个进程同时写不会踩同一个临时文件；
- * 3. 先写临时文件再改名，进程被杀也不会留下半个 JSON。
- * 写不了不影响路由。
+ * 三个进程共存时的做法：
+ * 1. 先读回磁盘再合并，各进程只补自己新写的行；
+ * 2. 临时文件名带 pid 与随机后缀，同时写不踩同一个文件；
+ * 3. 写 tmp 前后各看一次目标文件的修改时间，中间被别人写过就重读合并一次再写，
+ *    降低「读—改—写」窗口里丢掉对方新行的概率；两次都没抢到就放弃，下次判定再写。
+ * 写失败不影响路由。
  */
 function saveRecent(recent, limit) {
+  const target = recentPath()
+  const temporary = `${target}.${process.pid}.${Math.random().toString(36).slice(2, 8)}.tmp`
+  const mtimeOf = () => {
+    try {
+      return statSync(target).mtimeMs
+    } catch {
+      return 0
+    }
+  }
   try {
     mkdirSync(provisionRoot(), { recursive: true })
-    const target = recentPath()
-    const merged = loadRecent(limit)
-    for (const [key, value] of recent) {
-      const existing = merged.get(key)
-      if (existing === undefined || (Number(value?.at) || 0) >= (Number(existing?.at) || 0)) {
-        merged.set(key, value)
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      const before = mtimeOf()
+      const merged = loadRecent(limit)
+      for (const [key, value] of recent) {
+        const existing = merged.get(key)
+        if (existing === undefined || (Number(value?.at) || 0) >= (Number(existing?.at) || 0)) {
+          merged.set(key, value)
+        }
+      }
+      const rows = [...merged.entries()]
+        .sort((left, right) => (Number(right[1]?.at) || 0) - (Number(left[1]?.at) || 0))
+        .slice(0, limit)
+      writeFileSync(temporary, `${JSON.stringify({ version: 1, records: Object.fromEntries(rows) }, null, 2)}\n`)
+      if (mtimeOf() === before) {
+        renameSync(temporary, target)
+        return
       }
     }
-    const rows = [...merged.entries()]
-      .sort((left, right) => (Number(right[1]?.at) || 0) - (Number(left[1]?.at) || 0))
-      .slice(0, limit)
-    const temporary = `${target}.${process.pid}.${Math.random().toString(36).slice(2, 8)}.tmp`
-    writeFileSync(temporary, `${JSON.stringify({ version: 1, records: Object.fromEntries(rows) }, null, 2)}\n`)
-    renameSync(temporary, target)
   } catch {
     /* 写不了就算了，芯片最多少一条历史 */
+  } finally {
+    try {
+      rmSync(temporary, { force: true })
+    } catch {
+      /* 临时文件没建出来，或者已经被改名搬走 */
+    }
   }
 }
 
@@ -538,16 +565,58 @@ export function apply(ctx, config) {
   /** 浏览器半边最后一次报到的时间、它带上来的会话参数，以及组件收到的 props 键名。 */
   const clientSeen = { at: 0, lastQuery: null, keys: null, sid: null }
 
-  /** 记一次判定结果。芯片读的是这里，不读会话日志。值没变就不落盘。 */
-  function recordVerdict(key, tier, effort, provider, model) {
+  /** 上次落盘的时间。稳定档位也定期刷一次，免得磁盘上的 at 长期冻在被淘汰的边缘。 */
+  const saveState = { at: 0 }
+
+  /**
+   * 记一次判定结果。芯片读的是这里，不读会话日志。
+   *
+   * 两件事要靠 turn 区分开：
+   * - 同一轮里 agent/request 每个工具步骤都会调一次，档位不该变，这时只刷新时间，
+   *   不动 prevTier，否则刚记下的「low → high」会被本轮的重复调用抹成「high」；
+   * - 到了新一轮，才把上一轮的档位滚进 prevTier，芯片据此显示跨档变化。
+   *
+   * 落盘条件：档位变了，或者距上次落盘超过 SAVE_INTERVAL_MS。后者保证活跃会话在磁盘上
+   * 不会变成「最久没更新」而被容量淘汰挤掉。
+   */
+  function recordVerdict(key, tier, effort, provider, model, turn) {
     const previous = recent.get(key)
-    if (previous !== undefined
-      && previous.tier === tier
-      && previous.effort === effort
-      && previous.provider === provider
-      && previous.model === model) return
-    recent.set(key, { tier, effort, provider, model, at: Date.now() })
-    saveRecent(recent, MAX_RECENT)
+    const now = Date.now()
+    const sameTurn = previous !== undefined && turn !== undefined && previous.turn === turn
+    let changed = false
+
+    if (sameTurn) {
+      // 同一轮的工具步骤：档位不变，只刷新时间与磁盘上的 at。
+      recent.set(key, { ...previous, at: now })
+    } else {
+      changed = previous === undefined
+        || previous.tier !== tier
+        || previous.effort !== effort
+        || previous.provider !== provider
+        || previous.model !== model
+      recent.set(key, {
+        tier,
+        effort,
+        provider,
+        model,
+        at: now,
+        prevTier: previous === undefined ? null : previous.tier,
+        turn,
+      })
+    }
+
+    // 内存也要裁：只在读盘时截断会让这张表随着会话数一直涨。
+    if (recent.size > MAX_RECENT) {
+      const oldest = [...recent.entries()].sort((left, right) => (left[1]?.at ?? 0) - (right[1]?.at ?? 0))[0]
+      if (oldest !== undefined) recent.delete(oldest[0])
+    }
+
+    // 落盘：档位变了，或者距上次落盘超过 SAVE_INTERVAL_MS。
+    // 后者让「档位一直不变但会话很活跃」的记录在磁盘上不会变成最旧的那条。
+    if (changed || now - saveState.at > SAVE_INTERVAL_MS) {
+      saveState.at = now
+      saveRecent(recent, MAX_RECENT)
+    }
   }
 
   /**
@@ -730,7 +799,7 @@ export function apply(ctx, config) {
         if (pinned !== undefined && want !== undefined && want <= pinned) effort = base.reasoningEffort
       }
       written.set(key, { turn, effort })
-      recordVerdict(key, tier, effort, base.provider, base.model)
+      recordVerdict(key, tier, effort, base.provider, base.model, turnOf(payload))
       if (effort === base.reasoningEffort) return base
       log(`turn ${turn} ${tier} -> ${target} => ${effort}（${base.provider}/${base.model}）`)
       return { ...base, reasoningEffort: effort }
@@ -763,7 +832,7 @@ export function apply(ctx, config) {
       const effort = pickEffort(await effortsFor(route.provider, route.model), now.tiers[tier] ?? now.tiers.fallback)
       if (effort === undefined) return decision
       if (now.notify !== 'always' && effort === route.reasoningEffort) return decision
-      recordVerdict(key, tier, effort, route.provider, route.model)
+      recordVerdict(key, tier, effort, route.provider, route.model, turnOf(payload))
       trace(`pre-step: 插入提示 ${tier} -> ${effort}（${route.provider}/${route.model}）`)
       return { ...decision, messages: [...decision.messages, notice(tier, effort, route.provider, route.model)] }
     } catch (error) {

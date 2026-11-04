@@ -20,13 +20,6 @@ window.__ModuleLoader__.load({
     const ENDPOINT = '/effort-router/config'
     const LAST_ENDPOINT = '/effort-router/last'
 
-    /** 档位圆点的颜色：只区分强弱，不跟着品牌色走。 */
-    const TIER_DOT = {
-      low: 'var(--dsw-alias-label-tertiary, var(--dsw-alias-label-secondary))',
-      high: 'var(--dsw-alias-state-warn-primary)',
-      max: 'var(--dsw-alias-brand-primary)',
-    }
-
     /** 判定服务给的档位，以及每个档位能映射到的强度名（宿主侧的粗序）。 */
     const TIER_KEYS = ['low', 'high', 'max', 'fallback']
     const TIER_LABEL = { low: '简单', high: '中等', max: '困难', fallback: '兜底' }
@@ -93,19 +86,18 @@ window.__ModuleLoader__.load({
       chipBox: {
         display: 'inline-flex',
         alignItems: 'center',
-        gap: 5,
-        padding: '2px 8px',
+        // 不参与压缩：文字 nowrap，被挤会压到旁边的模型选择器上。
+        flex: 'none',
+        padding: '0 2px',
         marginRight: 6,
+        // 只写 fontSize：`font` 是简写，写在后面会把字号一并重置成继承值。
         fontSize: 11,
-        font: 'inherit',
-        borderRadius: 999,
-        border: '1px solid var(--dsw-alias-border-l2)',
-        background: 'var(--dsw-alias-bg-layer-2)',
+        background: 'transparent',
+        border: '0',
         color: 'var(--dsw-alias-label-secondary)',
         whiteSpace: 'nowrap',
         cursor: 'default',
       },
-      chipDot: { width: 6, height: 6, borderRadius: '50%', flex: 'none' },
     }
 
     function ConfigPanel() {
@@ -260,9 +252,8 @@ window.__ModuleLoader__.load({
             if (!alive) return
             const records = Array.isArray(body.records) ? body.records : []
             const current = body.current !== null && body.current !== undefined ? body.current : null
-            // 有本会话的记录就用它；否则只在历史里仅有一条时才退化成那条。
-            // 多会话时不猜：宁可空着，也不显示别的会话的档位。
-            setRow(current !== null ? current : (records.length === 1 ? records[0] : null))
+            // 本会话没有记录时退到最近一条：芯片要一直可见，多会话串一下比空着好查。
+            setRow(current !== null ? current : (records.length > 0 ? records[0] : null))
           } catch {
             /* 拿不到就不显示，别打扰输入 */
           }
@@ -276,13 +267,19 @@ window.__ModuleLoader__.load({
       }, [sessionId])
 
       if (row === null || row === undefined) return null
+      // 有上一轮就固定两段：上一轮 → 这一轮（相同也照写，一眼看出没变）。
+      // 还没有上一轮时（首轮、或旧版记录没有这个字段）只显示当前档，不留占位符。
+      const current = String(row.tier)
+      const previous = row.prevTier === undefined || row.prevTier === null ? null : String(row.prevTier)
+      const label = previous === null ? current : `${previous} → ${current}`
+      const detail = `${current} → ${row.effort}（${row.provider}/${row.model}）`
+      // 纯文本 + aria-label：读屏能念出完整含义，悬停也能看到强度与模型。
       return h('div', {
         style: S.chipBox,
-        title: `${row.provider}/${row.model}`,
-      },
-        h('span', { style: { ...S.chipDot, background: TIER_DOT[row.tier] ?? 'var(--dsw-alias-label-secondary)' } }),
-        h('span', null, `${row.tier} → ${row.effort}`),
-      )
+        role: 'status',
+        'aria-label': detail,
+        title: detail,
+      }, h('span', null, label))
     }
 
     function apply(ctx) {

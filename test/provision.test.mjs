@@ -73,7 +73,8 @@ async function waitFor(predicate, timeoutMs = 8000) {
     check('部署: 传了判定服务地址', seen.judgeUrl, 'http://127.0.0.1:1/judge')
     check('部署: 冷启动超时给了 300 秒', seen.timeout, '300')
   }
-  rmSync(root, { recursive: true, force: true })
+  // Windows 上子进程可能还占着目录，删不掉就留给系统清，不影响断言。
+  try { rmSync(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 120 }) } catch { /* 忽略 */ }
 }
 
 // provision: false 时不部署
@@ -88,7 +89,8 @@ async function waitFor(predicate, timeoutMs = 8000) {
   })
   await new Promise((resolve) => setTimeout(resolve, 600))
   check('provision 关闭: 不动子进程', existsSync(marker), false)
-  rmSync(root, { recursive: true, force: true })
+  // Windows 上子进程可能还占着目录，删不掉就留给系统清，不影响断言。
+  try { rmSync(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 120 }) } catch { /* 忽略 */ }
 }
 
 // 部署失败：子进程非零退出，不抛错、不影响后续请求
@@ -105,7 +107,8 @@ async function waitFor(predicate, timeoutMs = 8000) {
   check('部署失败: 子进程跑过了', ran, true)
   const base = { provider: 'p', model: 'm', reasoningEffort: 'low' }
   check('部署失败: 请求原样返回', await ctx.handlers.get('agent/request')({ agent: { session: { id: 's' } }, turn: 1 }, async () => base), base)
-  rmSync(root, { recursive: true, force: true })
+  // Windows 上子进程可能还占着目录，删不掉就留给系统清，不影响断言。
+  try { rmSync(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 120 }) } catch { /* 忽略 */ }
 }
 
 console.log(failures === 0 ? '\n全部通过' : `\n${failures} 个失败`)

@@ -21,9 +21,10 @@ function check(name, actual, expected) {
   console.log(`${ok ? 'ok  ' : 'FAIL'} ${name}: ${JSON.stringify(actual)}${ok ? '' : ` (期望 ${JSON.stringify(expected)})`}`)
 }
 
+let judgeTier = 'high'
 const judge = createServer((req, res) => {
   res.setHeader('Content-Type', 'application/json')
-  res.end(JSON.stringify(req.url === '/health' ? { protocol: 'finetuned' } : { tier: 'high' }))
+  res.end(JSON.stringify(req.url === '/health' ? { protocol: 'finetuned' } : { tier: judgeTier }))
 })
 await new Promise((resolve) => judge.listen(0, '127.0.0.1', resolve))
 const judgeUrl = `http://127.0.0.1:${judge.address().port}/judge`
@@ -156,6 +157,50 @@ async function turnOf(ctx, agent, turn) {
   check('合并: 新会话写进去了', Object.keys(after).includes('session-later'), true)
   check('合并: 老会话还在', Object.keys(after).includes('session-dedupe'), true)
   check('合并: 条数只增不减', Object.keys(after).length >= Object.keys(before).length, true)
+}
+
+// 跨档变化要留下上一档，芯片才显示得出 low → high
+{
+  const ctx = fakeContext()
+  apply(ctx, { mode: 'auto', judgeUrl, startupWaitMs: 0, provision: false })
+  const agent = agentOf('session-cross')
+  const readCurrent = async () => (await call(lastOf(ctx), 'GET', undefined, '?session=session-cross')).body.current
+
+  await turnOf(ctx, agent, 1)
+  check('跨档: 首轮没有上一档', (await readCurrent()).prevTier, null)
+
+  judgeTier = 'low'
+  await turnOf(ctx, agent, 2)
+  const afterChange = await readCurrent()
+  check('跨档: 记下上一档', afterChange.prevTier, 'high')
+  check('跨档: 当前档是新值', afterChange.tier, 'low')
+
+  // 稳定在同一档：上一档对齐成当前，表示已经不再变化
+  await turnOf(ctx, agent, 3)
+  check('稳定: 上一档对齐当前', (await readCurrent()).prevTier, 'low')
+
+  judgeTier = 'high'
+}
+
+// 同一轮里 agent/request 会多次写记录，不能把刚记下的上一档抹掉
+{
+  const ctx = fakeContext()
+  apply(ctx, { mode: 'auto', judgeUrl, startupWaitMs: 0, provision: false })
+  const agent = agentOf('session-sameturn')
+  const readCurrent = async () => (await call(lastOf(ctx), 'GET', undefined, '?session=session-sameturn')).body.current
+
+  await turnOf(ctx, agent, 1)
+  judgeTier = 'low'
+  await turnOf(ctx, agent, 2)
+  check('同轮: 先记下跨档', (await readCurrent()).prevTier, 'high')
+
+  // 同一 turn 再来一次，模拟工具步骤
+  await turnOf(ctx, agent, 2)
+  const after = await readCurrent()
+  check('同轮重复: 上一档没被抹掉', after.prevTier, 'high')
+  check('同轮重复: 当前档不变', after.tier, 'low')
+
+  judgeTier = 'high'
 }
 
 // 落盘文件坏掉时，插件照样挂得上，只是历史为空

@@ -47,7 +47,9 @@ const third = mirrorLaya(source)
 check('换版本会重复制', readFileSync(join(third, 'keep.txt'), 'utf8'), 'fresh')
 check('重复制后版本更新', JSON.parse(readFileSync(join(third, 'package.json'), 'utf8')).version, '1.1.0')
 
-rmSync(home, { recursive: true, force: true })
+// Windows 上子进程可能还占着目录，删不掉就留给系统清，不影响断言。
+
+try { rmSync(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 120 }) } catch { /* 忽略 */ }
 rmSync(source, { recursive: true, force: true })
 console.log(failures === 0 ? '\n全部通过' : `\n${failures} 个失败`)
 process.exit(failures === 0 ? 0 : 1)
