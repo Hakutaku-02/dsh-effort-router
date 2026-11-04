@@ -6,12 +6,14 @@
  */
 import { createServer } from 'node:http'
 import { existsSync } from 'node:fs'
+import { mkdtempSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { apply } from '../index.js'
 
 process.env.ROUTER_EFFORT_LOG = `${tmpdir()}/router-effort-test.log`
+process.env.ROUTER_EFFORT_HOME = mkdtempSync(join(tmpdir(), 'effort-router-home-'))
 
 const root = process.env.DSH_ROOT ?? 'C:/Users/Hakutaku02/AppData/Local/Programs/DeepSeek Harness/resources/app/dsh'
 const cordisEntry = join(root, 'node_modules/@deepseek-ai/cordis/lib/index.js')

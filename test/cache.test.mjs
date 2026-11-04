@@ -4,10 +4,13 @@
  * 这里盯的是缓存的三条规则：命中要有寿命、解析失败不缓存、provider 拓扑变化立刻作废。
  */
 import { createServer } from 'node:http'
+import { mkdtempSync } from 'node:fs'
 import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { apply } from '../index.js'
 
 process.env.ROUTER_EFFORT_LOG = `${tmpdir()}/router-effort-test.log`
+process.env.ROUTER_EFFORT_HOME = mkdtempSync(join(tmpdir(), 'effort-router-home-'))
 process.env.ROUTER_EFFORT_STARTUP_WAIT_MS = '0'
 
 let failures = 0
@@ -73,7 +76,13 @@ async function turnOf(ctx, agent, turn, base = {}) {
 function call(route, method, body, url = '/') {
   return new Promise((resolve) => {
     const listeners = {}
-    const req = { method, url, on(event, fn) { listeners[event] = fn }, destroy() {} }
+    const req = {
+      method,
+      url,
+      headers: { 'content-type': 'application/json' },
+      on(event, fn) { listeners[event] = fn },
+      destroy() {},
+    }
     const res = {
       statusCode: 0,
       setHeader() {},
@@ -171,9 +180,7 @@ function call(route, method, body, url = '/') {
   apply(ctx, { mode: 'auto', judgeUrl, startupWaitMs: 0, provision: false })
   const route = ctx.routes.find((entry) => entry.path === '/effort-router/last')
 
-  const before = await call(route, 'GET', undefined, '/')
-  check('芯片: 初始为空', before.body.records, [])
-
+  // 这个文件里先跑的用例已经写过落盘文件，所以这里断言“能取到本会话”，不再断言空表。
   await turnOf(ctx, agentOf('session-chip'), 1)
   const after = await call(route, 'GET', undefined, '?session=session-chip')
   check('芯片: 有本会话记录', after.body.current?.session, 'session-chip')

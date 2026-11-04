@@ -89,7 +89,8 @@ window.__ModuleLoader__.load({
         color: 'var(--dsw-alias-label-primary)',
       },
       note: { fontSize: 12, color: 'var(--dsw-alias-label-secondary)' },
-      chip: {
+      /** 输入框旁芯片的外框。名字与配置页的 chip() 区分开，两者都用会互相覆盖。 */
+      chipBox: {
         display: 'inline-flex',
         alignItems: 'center',
         gap: 5,
@@ -233,6 +234,20 @@ window.__ModuleLoader__.load({
       const sessionId = props === undefined || props === null ? undefined : props.sessionId
       const [row, setRow] = React.useState(null)
 
+      // 一次性的形状上报：把组件实际收到的 props 键名与 sessionId 传给宿主。
+      // 排“拿不到会话”时不用再猜 props 叫什么。
+      React.useEffect(() => {
+        try {
+          const keys = props === undefined || props === null ? [] : Object.keys(props)
+          const sid = sessionId === undefined || sessionId === null ? '' : String(sessionId)
+          void fetch(`/effort-router/seen?keys=${encodeURIComponent(keys.join(','))}&sid=${encodeURIComponent(sid)}`)
+        } catch {
+          /* 自检失败不影响功能 */
+        }
+        // 只在挂载时报一次
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+      }, [])
+
       React.useEffect(() => {
         let alive = true
         const load = async () => {
@@ -243,10 +258,11 @@ window.__ModuleLoader__.load({
             const res = await fetch(LAST_ENDPOINT + query)
             const body = await res.json()
             if (!alive) return
-            const current = body.current !== null && body.current !== undefined
-              ? body.current
-              : (Array.isArray(body.records) && body.records.length > 0 ? body.records[0] : null)
-            setRow(current)
+            const records = Array.isArray(body.records) ? body.records : []
+            const current = body.current !== null && body.current !== undefined ? body.current : null
+            // 有本会话的记录就用它；否则只在历史里仅有一条时才退化成那条。
+            // 多会话时不猜：宁可空着，也不显示别的会话的档位。
+            setRow(current !== null ? current : (records.length === 1 ? records[0] : null))
           } catch {
             /* 拿不到就不显示，别打扰输入 */
           }
@@ -261,7 +277,7 @@ window.__ModuleLoader__.load({
 
       if (row === null || row === undefined) return null
       return h('div', {
-        style: S.chip,
+        style: S.chipBox,
         title: `${row.provider}/${row.model}`,
       },
         h('span', { style: { ...S.chipDot, background: TIER_DOT[row.tier] ?? 'var(--dsw-alias-label-secondary)' } }),

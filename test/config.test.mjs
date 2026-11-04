@@ -4,10 +4,13 @@
  * 设置面在真实宿主里由 dsh-settings 提供；这里用假 settings 记录写入参数，验证落盘路径。
  */
 import { createServer } from 'node:http'
+import { mkdtempSync } from 'node:fs'
 import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { apply, Config } from '../index.js'
 
 process.env.ROUTER_EFFORT_LOG = `${tmpdir()}/router-effort-test.log`
+process.env.ROUTER_EFFORT_HOME = mkdtempSync(join(tmpdir(), 'effort-router-home-'))
 process.env.ROUTER_EFFORT_STARTUP_WAIT_MS = '0'
 
 // 真判定服务太小，直接起一个：热改之后要能真的判出档位，才算“生效”。
@@ -45,7 +48,11 @@ function fakeContext(options = {}) {
       if (name === 'settings' && withSettings) {
         return {
           describe() { return [{ ns: 'effort-router', value: { ...state } }] },
-          async update(ns, patch) { updates.push({ ns, patch }); Object.assign(state, patch) },
+          async update(ns, patch) {
+            updates.push({ ns, patch })
+            if (options.updateThrows === true) throw new Error('write refused')
+            Object.assign(state, patch)
+          },
         }
       }
       if (name === 'llm') {
@@ -66,10 +73,16 @@ function fakeContext(options = {}) {
 }
 
 /** 调一条已注册的路由；POST 传 JSON body。 */
-function call(route, method, body) {
+function call(route, method, body, url = '/', contentType = 'application/json') {
   return new Promise((resolve) => {
     const listeners = {}
-    const req = { method, on(event, fn) { listeners[event] = fn }, destroy() {} }
+    const req = {
+      method,
+      url,
+      headers: { 'content-type': contentType },
+      on(event, fn) { listeners[event] = fn },
+      destroy() {},
+    }
     const res = {
       statusCode: 0,
       setHeader() {},
@@ -146,6 +159,26 @@ const routeOf = (ctx, path) => ctx.routes.find((entry) => entry.path === path)
   check('档位: 热改生效', config.reasoningEffort, 'low')
 }
 
+// 跨站写保护与写入白名单
+{
+  const ctx = fakeContext()
+  apply(ctx, { mode: 'auto', judgeUrl, startupWaitMs: 0, provision: false })
+  const route = routeOf(ctx, '/effort-router/config')
+
+  const plain = await call(route, 'POST', { mode: 'manual' }, '/', 'text/plain')
+  check('跨站写: 非 JSON 类型被拒', plain.code, 415)
+  check('跨站写: 没落盘', ctx.updates.length, 0)
+
+  const fileUrl = await call(route, 'POST', { judgeUrl: 'file:///etc/passwd' })
+  check('judgeUrl: 非 http(s) 被拒', fileUrl.code, 503)
+
+  const badNotify = await call(route, 'POST', { notify: '随时' })
+  check('notify: 非法值被忽略', badNotify.code, 503)
+
+  const good = await call(route, 'POST', { judgeUrl: 'https://example.com/judge' })
+  check('judgeUrl: 合法地址接受', good.code, 200)
+}
+
 // 没有设置面：只读，mode 退回内存开关
 {
   const ctx = fakeContext({ settings: false })
@@ -156,7 +189,16 @@ const routeOf = (ctx, path) => ctx.routes.find((entry) => entry.path === path)
 
   const saved = await call(routeOf(ctx, '/effort-router/config'), 'POST', { mode: 'manual' })
   check('无设置面: 保存落内存', saved.body.persisted, false)
-  check('无设置面: 未调 update', ctx.updates.length, 0)
+}
+
+// 写入被拒：状态码 503，detail 带上宿主给的原因，且确实调过一次 update
+{
+  const ctx = fakeContext({ updateThrows: true })
+  apply(ctx, { mode: 'auto', judgeUrl, startupWaitMs: 0, provision: false })
+  const saved = await call(routeOf(ctx, '/effort-router/config'), 'POST', { mode: 'manual' })
+  check('写入被拒: 状态码', saved.code, 503)
+  check('写入被拒: 带原因', saved.body.detail, 'write refused')
+  check('写入被拒: 确实调了 update', ctx.updates.length, 1)
 }
 
 judge.closeAllConnections?.()

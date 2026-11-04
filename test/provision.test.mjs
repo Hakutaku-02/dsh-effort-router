@@ -9,6 +9,7 @@ import { join } from 'node:path'
 import { apply } from '../index.js'
 
 process.env.ROUTER_EFFORT_LOG = `${tmpdir()}/router-effort-test.log`
+process.env.ROUTER_EFFORT_HOME = mkdtempSync(join(tmpdir(), 'effort-router-home-'))
 process.env.ROUTER_EFFORT_STARTUP_WAIT_MS = '0'
 process.env.ROUTER_EFFORT_START_WAIT_MS = '0'
 

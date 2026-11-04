@@ -2,7 +2,7 @@
  * 部署镜像的行为：把依赖里的 laya 包复制到稳定目录，版本没变就不重复复制。
  * 全程在临时目录里做，不碰真的 ~/.dsh。
  */
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync, appendFileSync } from 'node:fs'
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync, utimesSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -35,7 +35,8 @@ check('镜像里有 setup 脚本', existsSync(join(first, 'bin', 'setup.mjs')), 
 // 复制完成后往镜像里写个标记；同版本再调一次不该把标记冲掉
 const marker = join(first, 'keep.txt')
 writeFileSync(marker, 'stale')
-appendFileSync(join(home, 'laya', 'package.json'), '')
+// 镜像里的 package.json 被别的东西碰过（mtime 变了），但版本号没变：不该重新复制
+utimesSync(join(home, 'laya', 'package.json'), new Date(), new Date())
 writeFileSync(join(source, 'keep.txt'), 'fresh')
 const second = mirrorLaya(source)
 check('同版本不重复制', readFileSync(join(second, 'keep.txt'), 'utf8'), 'stale')

@@ -19,6 +19,13 @@ provider 和 model 用模型选择器里的那个。换厂商、加新 provider�
 判定结果出现在输入框右侧的芯片上，形如 `high → max`，悬停能看到用的是哪个模型。判定还没发生时
 芯片不显示。芯片读的是插件自己的 `/effort-router/last`，每 3 秒问一次，不往对话里插消息。
 
+最近一次判定会落盘到 `~/.dsh/router-effort/last.json`（与部署目录同一个根，最多留 50 条），
+所以重启 DSH 之后芯片直接就有内容，不用等下一轮判定。落盘是「先写临时文件再改名」，
+进程被杀也不会留下半个 JSON。
+
+芯片按会话取，不是取最近一条：前端把 `sessionId` 传上来，宿主侧两边都去掉 `session-` 前缀
+再比，所以带前缀和不带前缀都能对上。
+
 芯片里显示的模型名取自会话的模型选择状态（`sessionProjections.stateOf(session, 'modelSelection')`，
 `pending ?? lastUsed`），所以这一轮刚换过模型也能显示对。
 
@@ -275,7 +282,8 @@ DSH_ROOT=<DSH 安装目录> npm run test:cordis   # 装在别处时指定
   要加进 `ORDER`，否则那个强度会被当成未知并跳过。
 - 一轮只判一次，判的是这一轮第一条用户消息。中途追加的长任务不会重新判。
 - 子代理不处理：`session.header.origin === 'subagent'` 时直接放行，强度跟主代理走。
-- 芯片拿不到 `slotProps.sessionId` 时退化成显示最近一条判定。多会话同时开着时可能显示成别的会话的。
+- 芯片拿不到 `slotProps.sessionId` 时退化成显示最近一条判定。实测 0.2.1-rc.2 会传 `sessionId`，
+  这个分支只在没有会话绑定的槽位里才走到。
 - client 半边改了要刷新窗口（`Ctrl+R`）才看得到。Electron 会按 bundle 的内容版本缓存，宿主侧改动不受影响。
 - 只在 Windows 上验证过。路径拼接和 pythonw 查找是 Windows 习惯，别的平台没测。
 

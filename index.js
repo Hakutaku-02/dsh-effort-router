@@ -13,7 +13,7 @@
 
 import { spawn } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
-import { appendFileSync, closeSync, cpSync, existsSync, mkdirSync, openSync, readFileSync } from 'node:fs'
+import { appendFileSync, closeSync, cpSync, existsSync, mkdirSync, openSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import { homedir, tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -38,6 +38,12 @@ const MODES = ['auto', 'manual']
 /** 档位到强度名的默认映射，也是页面里那四个下拉的名字。 */
 const TIER_KEYS = ['low', 'high', 'max', 'fallback']
 const DEFAULT_TIERS = { low: 'low', high: 'high', max: 'max', fallback: 'low' }
+/** 最近判定的保留条数。落盘和芯片列表都用它。 */
+const MAX_RECENT = 50
+/** 查询参数的长度上限。端点名与模型名都很短，超长的一律当非法。 */
+const MAX_QUERY_LENGTH = 200
+/** 模型档位缓存的容量上限，防止外部传入的端点名把这张表撑大。 */
+const MAX_MODEL_CACHE = 200
 
 /**
  * 配置 schema。
@@ -355,6 +361,68 @@ function provisionRoot() {
   return process.env.ROUTER_EFFORT_HOME || join(homedir(), '.dsh', 'router-effort')
 }
 
+/** 最近判定落盘的位置。重启后芯片要能显示上一次的档位。 */
+function recentPath() {
+  return join(provisionRoot(), 'last.json')
+}
+
+/**
+ * 会话 id 的归一化。
+ *
+ * 宿主侧的 session.id 带 `session-` 前缀，前端 `sessionId` 有时给裸 uuid。
+ * 两边都归一化再比，芯片才能精确对上自己的会话。
+ */
+function bareSession(value) {
+  return String(value ?? '').replace(/^session-/, '')
+}
+
+/** 读回上次落盘的判定。文件不存在、坏掉、结构不对都当空表；只留最新的 limit 条。 */
+function loadRecent(limit) {
+  try {
+    const parsed = JSON.parse(readFileSync(recentPath(), 'utf8'))
+    const rows = parsed !== null && typeof parsed === 'object' && parsed.records !== null && typeof parsed.records === 'object'
+      ? parsed.records
+      : {}
+    return new Map(Object.entries(rows)
+      .filter((entry) => entry[1] !== null && typeof entry[1] === 'object')
+      .sort((left, right) => (Number(right[1]?.at) || 0) - (Number(left[1]?.at) || 0))
+      .slice(0, limit))
+  } catch {
+    return new Map()
+  }
+}
+
+/**
+ * 把最近判定写回磁盘，只留最近几条。
+ *
+ * 三处细节都是为了多个进程共存时不互相踩：
+ * 1. 先读回磁盘再合并，各进程只补自己新写的行，不整表覆盖对方的记录；
+ * 2. 临时文件名带 pid 与随机后缀，两个进程同时写不会踩同一个临时文件；
+ * 3. 先写临时文件再改名，进程被杀也不会留下半个 JSON。
+ * 写不了不影响路由。
+ */
+function saveRecent(recent, limit) {
+  try {
+    mkdirSync(provisionRoot(), { recursive: true })
+    const target = recentPath()
+    const merged = loadRecent(limit)
+    for (const [key, value] of recent) {
+      const existing = merged.get(key)
+      if (existing === undefined || (Number(value?.at) || 0) >= (Number(existing?.at) || 0)) {
+        merged.set(key, value)
+      }
+    }
+    const rows = [...merged.entries()]
+      .sort((left, right) => (Number(right[1]?.at) || 0) - (Number(left[1]?.at) || 0))
+      .slice(0, limit)
+    const temporary = `${target}.${process.pid}.${Math.random().toString(36).slice(2, 8)}.tmp`
+    writeFileSync(temporary, `${JSON.stringify({ version: 1, records: Object.fromEntries(rows) }, null, 2)}\n`)
+    renameSync(temporary, target)
+  } catch {
+    /* 写不了就算了，芯片最多少一条历史 */
+  }
+}
+
 /**
  * 把包依赖里的 laya 镜像到部署目录。
  *
@@ -465,14 +533,21 @@ export function apply(ctx, config) {
   const infos = new Map()
   /** 会话 -> 本轮 pre-step 判出的档位，供同一步的请求复用，避免问两次。 */
   const pending = new Map()
-  /** 会话 -> 最近一次判定，供输入框旁的芯片显示。 */
-  const recent = new Map()
-  /** 浏览器半边最后一次报到的时间。排查“芯片不出现”时看它有没有值。 */
-  const clientSeen = { at: 0 }
+  /** 会话 -> 最近一次判定，供输入框旁的芯片显示。启动时从磁盘读回，重启后芯片不会空。 */
+  const recent = loadRecent(MAX_RECENT)
+  /** 浏览器半边最后一次报到的时间、它带上来的会话参数，以及组件收到的 props 键名。 */
+  const clientSeen = { at: 0, lastQuery: null, keys: null, sid: null }
 
-  /** 记一次判定结果。芯片读的是这里，不读会话日志。 */
+  /** 记一次判定结果。芯片读的是这里，不读会话日志。值没变就不落盘。 */
   function recordVerdict(key, tier, effort, provider, model) {
+    const previous = recent.get(key)
+    if (previous !== undefined
+      && previous.tier === tier
+      && previous.effort === effort
+      && previous.provider === provider
+      && previous.model === model) return
     recent.set(key, { tier, effort, provider, model, at: Date.now() })
+    saveRecent(recent, MAX_RECENT)
   }
 
   /**
@@ -513,6 +588,11 @@ export function apply(ctx, config) {
       list = []
     }
     if (list.length > 0) {
+      // 缓存加容量上限：provider/model 名是外部输入，不设上限会让这张表无界增长。
+      if (infos.size >= MAX_MODEL_CACHE) {
+        const oldest = [...infos.entries()].sort((left, right) => (left[1]?.at ?? 0) - (right[1]?.at ?? 0))[0]
+        if (oldest !== undefined) infos.delete(oldest[0])
+      }
       infos.set(key, { at: Date.now(), list })
       trace(`model ${key} efforts=${JSON.stringify(list)}`)
     } else {
@@ -701,10 +781,25 @@ export function apply(ctx, config) {
       return
     }
     trace('webServer 就绪，注册 /effort-router/mode 与 /effort-router/judge（含旧别名）')
-    /** 读 JSON 请求体；解析失败直接回 400。 */
+    /**
+     * 读 JSON 请求体。
+     *
+     * 强制 `application/json`：插件路由不受宿主 auth fence 保护，浏览器里任意页面都能向
+     * localhost 发 no-cors 的 text/plain POST。要求 JSON 类型会让跨站请求触发预检而失败，
+     * 顺手挡掉配置被跨站改写的路径。
+     */
     const collectJson = (req, send, onBody) => {
+      const headers = req !== null && typeof req === 'object' && req.headers !== undefined ? req.headers : {}
+      const contentType = String(headers['content-type'] ?? '').toLowerCase()
+      if (!contentType.includes('application/json')) {
+        send(415, { error: 'content-type must be application/json' })
+        return
+      }
       let raw = ''
-      req.on('data', (chunk) => { raw += chunk; if (raw.length > 8192) req.destroy() })
+      req.on('data', (chunk) => {
+        raw += chunk
+        if (Buffer.byteLength(raw) > 8192) req.destroy()
+      })
       req.on('end', () => {
         let body
         try {
@@ -726,8 +821,20 @@ export function apply(ctx, config) {
       const clean = {}
       if (MODES.includes(patch.mode)) clean.mode = patch.mode
       if (JUDGE_SOURCES.includes(patch.judgeSource)) clean.judgeSource = patch.judgeSource
-      if (typeof patch.judgeUrl === 'string' && patch.judgeUrl !== '') clean.judgeUrl = patch.judgeUrl
-      if (typeof patch.notify === 'string') clean.notify = patch.notify
+      if (typeof patch.judgeUrl === 'string' && patch.judgeUrl !== '') {
+        // 判定地址每轮都会收到用户原文，必须限定成 http(s)，别的 scheme 一律拒绝。
+        let parsed
+        try {
+          parsed = new URL(patch.judgeUrl)
+        } catch {
+          parsed = undefined
+        }
+        if (parsed === undefined || (parsed.protocol !== 'http:' && parsed.protocol !== 'https:')) {
+          return { ok: false, detail: 'judgeUrl 必须是 http(s) 地址' }
+        }
+        clean.judgeUrl = parsed.toString()
+      }
+      if (patch.notify === '' || patch.notify === 'off' || patch.notify === 'always') clean.notify = patch.notify
       if (patch.tiers !== undefined && patch.tiers !== null && typeof patch.tiers === 'object') {
         const next = {}
         for (const key of TIER_KEYS) {
@@ -843,8 +950,8 @@ export function apply(ctx, config) {
         provider = ''
         model = ''
       }
-      if (provider === '' || model === '') {
-        send(400, { error: 'provider and model are required' })
+      if (provider === '' || model === '' || provider.length > MAX_QUERY_LENGTH || model.length > MAX_QUERY_LENGTH) {
+        send(400, { error: 'provider and model are required, at most 200 characters each' })
         return
       }
       void (async () => {
@@ -875,17 +982,47 @@ export function apply(ctx, config) {
       } catch {
         session = ''
       }
-      const records = [...recent.entries()]
+      if (session.length > MAX_QUERY_LENGTH) session = ''
+      const all = [...recent.entries()]
         .map(([key, value]) => ({ session: key, ...value }))
         .sort((left, right) => right.at - left.at)
-        .slice(0, 20)
-      const current = session === '' ? undefined : records.find((row) => row.session === session)
-      send(200, { records, current: current === undefined ? null : current, seenAt: clientSeen.at })
+      // 展示只取前 20 条，但“当前会话”在完整列表里找，免得命中被截掉。
+      const records = all.slice(0, 20)
+      clientSeen.lastQuery = session === '' ? null : session
+      const wanted = bareSession(session)
+      const current = wanted === ''
+        ? undefined
+        : all.find((row) => bareSession(row.session) === wanted)
+      send(200, {
+        records,
+        current: current === undefined ? null : current,
+        seenAt: clientSeen.at,
+        lastQuery: clientSeen.lastQuery,
+        propsKeys: clientSeen.keys,
+        propsSid: clientSeen.sid,
+      })
     }
     /** 浏览器半边的报到点：有值就说明 client bundle 在页面里跑过。 */
     const seenHandler = (req, res) => {
+      if (req.method !== 'GET' && req.method !== 'HEAD') {
+        res.statusCode = 405
+        res.end()
+        return
+      }
+      let keys = ''
+      let sid = ''
+      try {
+        const query = new URL(typeof req.url === 'string' ? req.url : '/', 'http://127.0.0.1').searchParams
+        keys = (query.get('keys') || '').slice(0, MAX_QUERY_LENGTH)
+        sid = (query.get('sid') || '').slice(0, MAX_QUERY_LENGTH)
+      } catch {
+        keys = ''
+        sid = ''
+      }
       clientSeen.at = Date.now()
-      const text = JSON.stringify({ ok: true, at: clientSeen.at })
+      if (keys !== '') clientSeen.keys = keys
+      if (sid !== '') clientSeen.sid = sid
+      const text = JSON.stringify({ ok: true, at: clientSeen.at, keys: clientSeen.keys ?? null, sid: clientSeen.sid ?? null })
       res.statusCode = 200
       res.setHeader('Content-Type', 'application/json; charset=utf-8')
       res.setHeader('Content-Length', String(Buffer.byteLength(text)))

@@ -4,11 +4,14 @@
  * 判定服务用本地临时 HTTP 服务顶替，不依赖真服务在线。
  */
 import { createServer } from 'node:http'
+import { mkdtempSync } from 'node:fs'
 import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { apply } from '../index.js'
 
 // 挂载痕迹写到测试自己的文件，宿主那份只留真实重启的记录。
 process.env.ROUTER_EFFORT_LOG = `${tmpdir()}/router-effort-test.log`
+process.env.ROUTER_EFFORT_HOME = mkdtempSync(join(tmpdir(), 'effort-router-home-'))
 // 判定服务地址指向不可用端口时，启动探活不该把测试拖住。
 process.env.ROUTER_EFFORT_STARTUP_WAIT_MS = '0'
 

@@ -7,7 +7,6 @@
   "exports": {
     ".": "./index.js",
     "./client": "./client.js",
-    "./user": "./user/index.js",
     "./cordis.patch.yml": "./cordis.patch.yml",
     "./package.json": "./package.json",
     "./locale/*.json": "./locale/*.json"
@@ -40,7 +39,7 @@
     "dsh-router-laya": "^2.2.1"
   },
   "scripts": {
-    "test": "node test/effort.test.mjs && node test/apply.test.mjs && node test/mirror.test.mjs && node test/provision.test.mjs && node test/health.test.mjs && node test/config.test.mjs && node test/cache.test.mjs && node test/user.test.mjs",
+    "test": "node test/effort.test.mjs && node test/apply.test.mjs && node test/mirror.test.mjs && node test/provision.test.mjs && node test/health.test.mjs && node test/config.test.mjs && node test/cache.test.mjs && node test/persist.test.mjs",
     "test:cordis": "node test/cordis.test.mjs",
     "prepublishOnly": "npm test"
   },
