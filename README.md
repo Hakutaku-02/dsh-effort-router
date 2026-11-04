@@ -287,10 +287,17 @@ DSH_ROOT=<DSH 安装目录> npm run test:cordis   # 装在别处时指定
 - client 半边改了要刷新窗口（`Ctrl+R`）才看得到。Electron 会按 bundle 的内容版本缓存，宿主侧改动不受影响。
 - 只在 Windows 上验证过。路径拼接和 pythonw 查找是 Windows 习惯，别的平台没测。
 
-## 发布前要改的
+## 发布
 
-`package.json` 里 `repository`、`bugs`、`homepage` 三处写的是 `YOUR_GITHUB_USER`，换成你的账号。
-改完再 `git push`。
+仓库地址已写在 `package.json` 的 `repository` / `bugs` / `homepage` 里。发版走两步：
+
+```bash
+npm test
+npm version patch && git push --follow-tags
+npm publish
+```
+
+`package-lock.json` 不进仓库（里面记着本机 DSH 安装路径），发版前重新生成即可。
 
 ## 许可证
 

@@ -14,7 +14,6 @@
   "files": [
     "index.js",
     "client.js",
-    "user",
     "cordis.patch.yml",
     "locale",
     "README.md",
@@ -53,10 +52,10 @@
   "author": "YG",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/YOUR_GITHUB_USER/dsh-effort-router.git"
+    "url": "git+https://github.com/Hakutaku-02/dsh-effort-router.git"
   },
   "bugs": {
-    "url": "https://github.com/YOUR_GITHUB_USER/dsh-effort-router/issues"
+    "url": "https://github.com/Hakutaku-02/dsh-effort-router/issues"
   },
-  "homepage": "https://github.com/YOUR_GITHUB_USER/dsh-effort-router#readme"
+  "homepage": "https://github.com/Hakutaku-02/dsh-effort-router#readme"
 }
