@@ -12,6 +12,9 @@ Thumbs.db
 # 打包产物
 *.tgz
 
+# lockfile 里记着本机 DSH 安装路径（peer 依赖指向那个 junction），换个机器就失效
+package-lock.json
+
 # API与Key
 .env/
 
