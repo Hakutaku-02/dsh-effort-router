@@ -266,12 +266,19 @@ window.__ModuleLoader__.load({
         }
       }, [sessionId])
 
-      if (row === null || row === undefined) return null
-      // 有上一轮就固定两段：上一轮 → 这一轮（相同也照写，一眼看出没变）。
-      // 还没有上一轮时（首轮、或旧版记录没有这个字段）只显示当前档，不留占位符。
-      const current = String(row.tier)
-      const previous = row.prevTier === undefined || row.prevTier === null ? null : String(row.prevTier)
-      const label = previous === null ? current : `${previous} → ${current}`
+      // 三种「没有档位」都显示 Default：
+      // 一条记录都没有、左段（上一轮）缺失、右段（这一轮）缺失。
+      if (row === null || row === undefined) {
+        return h('div', {
+          style: S.chipBox,
+          role: 'status',
+          'aria-label': '暂无判定',
+          title: '暂无判定',
+        }, h('span', null, 'Default'))
+      }
+      const current = row.tier === undefined || row.tier === null || row.tier === '' ? 'Default' : String(row.tier)
+      const previous = row.prevTier === undefined || row.prevTier === null || row.prevTier === '' ? 'Default' : String(row.prevTier)
+      const label = `${previous} → ${current}`
       const detail = `${current} → ${row.effort}（${row.provider}/${row.model}）`
       // 纯文本 + aria-label：读屏能念出完整含义，悬停也能看到强度与模型。
       return h('div', {
