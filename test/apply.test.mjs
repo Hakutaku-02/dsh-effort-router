@@ -47,7 +47,7 @@ const judgeUrl = `http://127.0.0.1:${judge.address().port}/judge`
  */
 function fakeContext(options = {}) {
   const handlers = new Map()
-  const { selection, efforts = [{ id: 'low' }, { id: 'high' }, { id: 'max' }] } = options
+  const { selection, onSelect, efforts = [{ id: 'low' }, { id: 'high' }, { id: 'max' }] } = options
   return {
     handlers,
     on(event, handler) { handlers.set(event, handler) },
@@ -61,6 +61,11 @@ function fakeContext(options = {}) {
       }
       if (name === 'sessionProjections' && selection !== undefined) {
         return { stateOf: () => selection }
+      }
+      if (name === 'sessionController' && onSelect !== undefined) {
+        return {
+          selectForNextRequest(agent, next) { onSelect(agent, next) },
+        }
       }
       return undefined
     },
@@ -237,6 +242,30 @@ const request = (base) => ({ provider: 'minimax-m-plan', model: 'MiniMax-M3.1-Fl
     async () => request({ reasoningEffort: 'high' }))
   check('用户选了 high: 判定 low 时不降', pinned.reasoningEffort, 'high')
   judgeTier = 'max'
+}
+
+// pre-step 必须把强度写进会话选择：不写的话 model-selection 会把强度剥掉，
+// 请求里连 thinking 参数都不会出现（实测抓包确认）。
+{
+  const calls = []
+  const ctx = fakeContext({ onSelect: (agent, next) => calls.push({ id: agent.session.id, ...next }) })
+  const agent = fakeAgent()
+  apply(ctx, { mode: 'auto', autoStart: false, judgeUrl })
+  judgeTier = 'max'
+  ctx.handlers.get('agent/inbox/claimed')({ agent, message })
+  await ctx.handlers.get('agent/pre-step')({ agent, step: 1 }, () => passThrough([]))
+  check('选择: 写入了 provider', calls[0]?.provider, 'cmdc-proxy')
+  check('选择: 写入了 model', calls[0]?.model, 'deepseek-v4.1-flash')
+  check('选择: 写入了强度', calls[0]?.reasoningEffort, 'max')
+  check('选择: 只写一次', calls.length, 1)
+
+  // notify 关掉也要写选择，只是不插提示
+  const quiet = []
+  const ctxQuiet = fakeContext({ onSelect: (agent, next) => quiet.push(next) })
+  apply(ctxQuiet, { mode: 'auto', autoStart: false, judgeUrl, notify: 'off' })
+  ctxQuiet.handlers.get('agent/inbox/claimed')({ agent, message })
+  const decision = await ctxQuiet.handlers.get('agent/pre-step')({ agent, step: 2 }, () => passThrough([]))
+  check('选择: notify off 时不插提示', decision.messages.length, 0)
 }
 
 judge.closeAllConnections?.()

@@ -179,14 +179,27 @@ curl http://127.0.0.1:<GUI 端口>/effort-router/judge
 # {"state":"up"|"provisioning"|"failed"|"missing"|"down","detail":"...","judgeUrl":"...","setupLog":"..."}
 ```
 
-## 设置页
+## 设置界面
 
-装好后在「插件 → 已安装 → 难度路由」的详情页里有配置区，能改判定方式、模式、判定服务地址、对话提示和档位映射。
-保存写回 profile 的 `cordis.patch.yml`。`mode`、`judgeUrl`、`notify`、`tiers` 标了 volatile，改完即时生效，
-其余字段下次重启生效。
+两个入口，读同一份配置，改哪边都一样：
 
-档位映射决定判定结果落到哪个强度：判定服务给 `low` / `high` / `max`，每个档位选一个强度名，
-实际写入的是"不超过它、且目标模型支持的最强档"。填了不认识的强度名会被拒绝。
+- 设置 → **思考强度**（左侧导航里独立的一节，`settings.section`，order 25）
+- 插件 → 已安装 → 难度路由 → 详情页里的配置区
+
+页面上能改：
+
+| 区块 | 内容 |
+| --- | --- |
+| 路由开关 | 开启 / 关闭。关掉后完全不改请求，等同手动模式 |
+| 判定方式 | 本地服务 / Jev。选 Jev 时展开下面四项 |
+| Jev 配置 | 地址、模型名、凭据引用名、置信度阈值 |
+| 模式 | 自动 / 手动（与总开关叠加：任一为关就不改请求） |
+| 判定服务 | 本地判定服务的地址 |
+| 对话提示 | 不提示 / 每轮都提示 |
+| 档位映射 | 简单 / 中等 / 困难 / 兜底 四个下拉 |
+
+保存写回 profile 的 `cordis.patch.yml`。`enabled`、`mode`、`judgeUrl`、`notify`、`tiers`、`jevUrl`、
+`jevModel`、`jevApiKeyEnv`、`jevConfidence` 都标了 volatile，改完即时生效；其余字段下次重启生效。
 
 页面不直接读写 profile：它调插件自己的 `/effort-router/config`，由宿主半边转成 `settings.update`。
 宿主没有设置面时页面只读，保存退化成只改内存里的模式。
@@ -194,24 +207,61 @@ curl http://127.0.0.1:<GUI 端口>/effort-router/judge
 ## 换模型与加模型
 
 档位不写死在插件里。每轮请求前按当前模型调 `llm.resolveModelInfo` 拿它自己声明的强度列表，
-再挑一个不超过目标强度的最强档。所以在 Models 页新加 provider 或 model 之后，第一次用它发消息
-就按它自己的档位工作，不用改插件配置，也不用重启。
+然后**按位置**把判定的三档落到这份列表上：`low` 取最低档，`high` 取中间档，`max` 取最高档。
+
+这样每个模型都能用满自己的范围，不用手工配：
+
+| 模型 | 声明的档位 | 判定 low | 判定 high | 判定 max |
+|---|---|---|---|---|
+| deepseek-v4.1-flash | low / high / max | low | high | max |
+| minimax-m3.1-flash | low / medium / high / xhigh / max | low | high | max |
+| gemini（三档） | low / medium / high | low | **medium** | **high** |
+
+按名字硬套是上一版的写法，会把「没有 max 的模型」的 max 压到 high、让「有 xhigh 的模型」
+永远用不到 medium 与 xhigh。想手工精调仍可以改 `tiers`，只要它与默认值不同就按那张表走。
 
 解析结果按 `modelInfoTtlMs`（默认 60 秒）缓存；解析不到档位时不写缓存，`llm/adapters-updated`
 事件会整体清掉缓存，所以改完模型定义下一轮就生效。
 
-想确认某个模型现在解析到哪些档位：
+想确认某个模型现在解析到哪些档位、以及某个判定档会落到哪一档：
 
 ```bash
 curl "http://127.0.0.1:<GUI 端口>/effort-router/models?provider=<provider>&model=<model>"
-# {"provider":"...","model":"...","efforts":["low","medium","high"],"ttlMs":60000}
+# {"efforts":["low","medium","high"],"ttlMs":60000}
+
+curl "http://127.0.0.1:<GUI 端口>/effort-router/models?provider=<provider>&model=<model>&tier=max"
+# {"efforts":["low","medium","high"],"tier":"max","picked":"high","ttlMs":60000}
 ```
+
+## 判定方式：本地服务或 Jev
+
+`judgeSource` 二选一。设为 `local` 走上一节的本地 Python 服务；设为 `jev` 走 TypeSafe 的 Jev 决策模型。
+
+Jev 不是对话模型，它走 System One 决策协议，`POST {model, state, questions}` 换回
+`{answers:{effort:{choice, confidence, probabilities}}}`，没有文本、没有推理链。所以它接不进
+DSH 的 provider 通道（那里只有 chat 协议），插件直接对 `jevUrl` 发请求，凭据按 `jevApiKeyEnv`
+解析：进程环境优先，其次宿主凭据服务。
+
+超时 12 秒（`jevTimeoutMs`），失败一律不改强度。置信度低于 `jevConfidence`（默认 0.6）时，在概率最高的两档里取
+更强的那个：宁可高估，不低估。
+
+```bash
+# 切到 Jev
+curl -X POST http://127.0.0.1:<GUI 端口>/effort-router/config \
+  -H "Content-Type: application/json" \
+  -d "{\"judgeSource\":\"jev\"}"
+```
+
+`tokenflux.dev` 上的实测结果：`GET /v1/models` 给出 `jev-latest` 与 `jev-preview`；`POST
+/v1/chat/completions` 会被拒绝（`protocol_not_allowed`），`POST /v1/systemone` 正常返回决策。
+默认配置就是对准这个端点。
 
 ## 配置
 
 | 字段 | 默认值 | 作用 |
 | --- | --- | --- |
-| `mode` | `auto` | `manual` 时完全不改请求 |
+| `enabled` | `true` | 总开关。`false` 时完全不改请求 |
+| `mode` | `auto` | `manual` 时完全不改请求；与 `enabled` 叠加 |
 | `judgeUrl` | `http://127.0.0.1:8765/judge` | 判定服务地址，也可以用环境变量 `LAYA_ROUTER_URL` |
 | `tiers` | `low/high/max` 同名，`fallback: low` | 档位到强度名的映射；标了 volatile，改完即时生效 |
 | `notify` | 空 | `always` 每轮都写提示，`off` 不写 |
@@ -220,7 +270,12 @@ curl "http://127.0.0.1:<GUI 端口>/effort-router/models?provider=<provider>&mod
 | `serviceScript` | 空 | 判定服务的入口脚本 |
 | `provision` | `true` | 服务起不来时跑 `dsh-router-laya` 的 `bin/setup.mjs` 部署一遍 |
 | `layaDir` | 空 | `dsh-router-laya` 包的位置，默认按依赖解析 |
-| `judgeSource` | `local` | 判定后端。`local` 走本机服务；`jev` 是留给判断型模型 API 的位置，当前不发起调用 |
+| `judgeSource` | `local` | 判定后端。`local` 走本机服务；`jev` 走 Jev 决策模型 |
+| `jevUrl` | `https://tokenflux.dev/v1/systemone` | Jev 的决策端点，只接受 http(s) |
+| `jevModel` | `jev-latest` | Jev 的模型名 |
+| `jevApiKeyEnv` | `TOKENFLUX_API_KEY` | 凭据引用名，先查进程环境再查宿主凭据服务 |
+| `jevConfidence` | `0.6` | 置信度阈值，低于它在最高的两档里取更强的 |
+| `jevTimeoutMs` | `12000` | Jev 请求超时 |
 | `startupWaitMs` | `3000` | 启动时等判定服务就绪的上限 |
 | `startWaitMs` | `90000` | 按 `servicePython` / `serviceScript` 拉起后等就绪的上限，覆盖约 70 秒冷启动 |
 | `provisionWaitMs` | `5000` | 部署脚本跑完后等就绪的上限 |
@@ -277,6 +332,24 @@ DSH_ROOT=<DSH 安装目录> npm run test:cordis   # 装在别处时指定
 它验证服务注册、`agent/request` 的返回值、`agent/pre-step` 插入的提示内容。找不到 DSH 时打印一行
 跳过说明，退出码 0，所以不影响 CI。
 
+## 强度怎么落到请求上
+
+判定出的强度不是靠改 `agent/request` 的返回值生效的。`dsh-agent` 的 model-selection 监听会在
+`agent/request` 上无条件剥掉继承来的 `reasoningEffort`：用户没在模型选择器里选档位时清空它，
+选了就用那个固定值。所以单靠 hook 返回值，请求里连 `thinking` 参数都不会出现。
+
+插件改走会话的模型选择：在 `agent/pre-step`（早于 prompt assemble）调
+`sessionController.selectForNextRequest(agent, {provider, model, reasoningEffort})`，
+assemble 时把这个值快照进去，请求就带着它发出去。实测抓包：
+
+```
+判定 low  → {"thinking":{"type":"adaptive"},"output_config":{"effort":"low"}}
+判定 high → {"thinking":{"type":"adaptive"},"output_config":{"effort":"high"}}
+```
+
+副作用是模型选择器里的「推理等级」会跟着判定跳。这是预期行为：那份选择就是请求的来源。
+`agent/request` 里仍保留一层改写，供没有 model-selection 的运行时兜底。
+
 ## 已知限制
 
 - 判定服务的协议是写死的：`POST judgeUrl {"task": "..."}` 返回 `{"tier": "..."}`，`GET /health` 返回
@@ -284,6 +357,8 @@ DSH_ROOT=<DSH 安装目录> npm run test:cordis   # 装在别处时指定
 - 强度排序靠名字：`off` < `minimal` < `low` < `medium` < `high` < `xhigh` < `max`。厂商出现新词时，
   要加进 `ORDER`，否则那个强度会被当成未知并跳过。
 - 一轮只判一次，判的是这一轮第一条用户消息。中途追加的长任务不会重新判。
+- 写会话选择依赖 `sessionController.selectForNextRequest`。运行时没有这个服务时退回只改内存，
+  此时请求不会带强度（芯片仍会显示判定结果，两者会不一致）。
 - 子代理不处理：`session.header.origin === 'subagent'` 时直接放行，强度跟主代理走。
 - 芯片跨档提示只在档位真的变化后出现一次；同一轮内的重复调用不会把它抹掉。
 - 芯片拿不到本会话的记录时退化成显示最近一条。实测 0.2.1-rc.2 会传 `sessionId`，

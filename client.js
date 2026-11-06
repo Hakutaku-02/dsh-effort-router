@@ -51,13 +51,6 @@ window.__ModuleLoader__.load({
         background: on ? 'color-mix(in srgb, var(--dsw-alias-brand-primary) 14%, transparent)' : 'transparent',
         color: on ? 'var(--dsw-alias-brand-primary)' : 'var(--dsw-alias-label-secondary)',
       }),
-      static: {
-        padding: '3px 10px',
-        fontSize: 12,
-        borderRadius: 999,
-        border: '1px solid var(--dsw-alias-border-l2)',
-        color: 'var(--dsw-alias-label-primary)',
-      },
       foot: { display: 'flex', alignItems: 'center', gap: 10 },
       tierRow: { display: 'flex', gap: 12, flexWrap: 'wrap' },
       tierCell: { display: 'inline-flex', alignItems: 'center', gap: 5, fontSize: 12 },
@@ -112,11 +105,16 @@ window.__ModuleLoader__.load({
           const body = await res.json()
           setCfg(body)
           setDraft({
+            enabled: body.enabled !== false,
             mode: body.mode === 'manual' ? 'manual' : 'auto',
             judgeSource: body.judgeSource === 'jev' ? 'jev' : 'local',
             judgeUrl: typeof body.judgeUrl === 'string' ? body.judgeUrl : '',
             notify: body.notify === 'always' ? 'always' : 'off',
             tiers: { low: 'low', high: 'high', max: 'max', fallback: 'low', ...(body.tiers || {}) },
+            jevUrl: typeof body.jevUrl === 'string' ? body.jevUrl : '',
+            jevModel: typeof body.jevModel === 'string' ? body.jevModel : '',
+            jevApiKeyEnv: typeof body.jevApiKeyEnv === 'string' ? body.jevApiKeyEnv : '',
+            jevConfidence: Number.isFinite(Number(body.jevConfidence)) ? Number(body.jevConfidence) : 0.6,
           })
         } catch (error) {
           setNote('读取失败：' + (error && error.message ? error.message : error))
@@ -136,7 +134,18 @@ window.__ModuleLoader__.load({
           const res = await fetch(ENDPOINT, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ mode: draft.mode, judgeUrl: draft.judgeUrl, notify: draft.notify, tiers: draft.tiers }),
+            body: JSON.stringify({
+              enabled: draft.enabled,
+              mode: draft.mode,
+              judgeSource: draft.judgeSource,
+              judgeUrl: draft.judgeUrl,
+              notify: draft.notify,
+              tiers: draft.tiers,
+              jevUrl: draft.jevUrl,
+              jevModel: draft.jevModel,
+              jevApiKeyEnv: draft.jevApiKeyEnv,
+              jevConfidence: draft.jevConfidence,
+            }),
           })
           const body = await res.json()
           if (body.ok === true) {
@@ -157,9 +166,68 @@ window.__ModuleLoader__.load({
 
       return h('div', { style: S.wrap },
         h('div', { style: S.row },
-          h('span', { style: S.label }, '判定方式'),
-          h('span', { style: S.static }, '本地服务'),
+          h('span', { style: S.label }, '路由开关'),
+          h('div', { style: S.seg },
+            [[true, '开启'], [false, '关闭']].map(([value, text]) => h('button', {
+              key: String(value),
+              style: S.chip(draft.enabled === value),
+              onClick: () => setDraft((previous) => ({ ...previous, enabled: value })),
+            }, text)),
+          ),
+          h('span', { style: S.note }, draft.enabled ? '' : '关掉后完全不改请求'),
         ),
+        h('div', { style: S.row },
+          h('span', { style: S.label }, '判定方式'),
+          h('div', { style: S.seg },
+            [['local', '本地服务'], ['jev', 'Jev']].map(([id, text]) => h('button', {
+              key: id,
+              style: S.chip(draft.judgeSource === id),
+              onClick: () => setDraft((previous) => ({ ...previous, judgeSource: id })),
+            }, text)),
+          ),
+        ),
+        draft.judgeSource === 'jev' ? h('div', { style: S.wrap },
+          h('div', { style: S.row },
+            h('span', { style: S.label }, 'Jev 地址'),
+            h('input', {
+              style: S.input,
+              value: draft.jevUrl,
+              placeholder: 'https://tokenflux.dev/v1/systemone',
+              onChange: (event) => setDraft((previous) => ({ ...previous, jevUrl: event.target.value })),
+            }),
+          ),
+          h('div', { style: S.row },
+            h('span', { style: S.label }, 'Jev 模型'),
+            h('input', {
+              style: S.input,
+              value: draft.jevModel,
+              placeholder: 'jev-latest',
+              onChange: (event) => setDraft((previous) => ({ ...previous, jevModel: event.target.value })),
+            }),
+          ),
+          h('div', { style: S.row },
+            h('span', { style: S.label }, '凭据名'),
+            h('input', {
+              style: S.input,
+              value: draft.jevApiKeyEnv,
+              placeholder: 'TOKENFLUX_API_KEY',
+              onChange: (event) => setDraft((previous) => ({ ...previous, jevApiKeyEnv: event.target.value })),
+            }),
+          ),
+          h('div', { style: S.row },
+            h('span', { style: S.label }, '置信度阈值'),
+            h('input', {
+              style: S.input,
+              type: 'number',
+              min: 0,
+              max: 1,
+              step: 0.05,
+              value: String(draft.jevConfidence),
+              onChange: (event) => setDraft((previous) => ({ ...previous, jevConfidence: Number(event.target.value) })),
+            }),
+            h('span', { style: S.note }, '低于它就在最高的两档里取更强的那档'),
+          ),
+        ) : null,
         h('div', { style: S.row },
           h('span', { style: S.label }, '模式'),
           h('div', { style: S.seg },
@@ -204,6 +272,10 @@ window.__ModuleLoader__.load({
               }, EFFORTS.map((id) => h('option', { key: id, value: id }, id))),
             )),
           ),
+        ),
+        h('div', { style: S.row },
+          h('span', { style: S.label }, ''),
+          h('span', { style: S.note }, '留默认值时按模型自己的档位自动分布（最低 / 中间 / 最高）；改成非默认值才按这张表走'),
         ),
         h('div', { style: S.foot },
           h('button', {
@@ -314,6 +386,15 @@ window.__ModuleLoader__.load({
         ))
       } catch (error) {
         console.error('[effort-router] 配置页注册失败', error)
+      }
+      // 设置界面左侧导航里的独立一节。插件详情页那块也留着，两处读同一份配置。
+      try {
+        ctx.slots.inject('settings.section', () => ctx.slots.register(
+          { name: 'settings.section', id: 'effort-router', order: 25, label: '思考强度' },
+          () => h(ConfigPanel),
+        ))
+      } catch (error) {
+        console.error('[effort-router] 设置节注册失败', error)
       }
     }
 

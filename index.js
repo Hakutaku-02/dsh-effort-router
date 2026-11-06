@@ -47,6 +47,25 @@ const MAX_QUERY_LENGTH = 200
 /** 模型档位缓存的容量上限，防止外部传入的端点名把这张表撑大。 */
 const MAX_MODEL_CACHE = 200
 
+/** Jev 的默认值：tokenflux 的 System One 决策端点。它不接受 chat/completions。 */
+const DEFAULT_JEV_URL = 'https://tokenflux.dev/v1/systemone'
+const DEFAULT_JEV_MODEL = 'jev-latest'
+const DEFAULT_JEV_API_KEY_ENV = 'TOKENFLUX_API_KEY'
+const DEFAULT_JEV_CONFIDENCE = 0.6
+const JEV_TIMEOUT_MS = 12000
+
+/**
+ * 三个档位的判定描述。
+ *
+ * Jev 是分类器，喂给它的 criteria 直接决定分档。用英文写：它的训练语料以英文为主，
+ * 中文判别精度官方明确弱一些。用户原文仍然原样作为 state 传进去。
+ */
+const TIER_CRITERIA = {
+  low: 'Greetings, acknowledgements, simple factual recall, formatting tweaks, single-line edits, or a question answerable at a glance.',
+  high: 'Routine code writing, summaries, translation, concept explanations, simple debugging, or a single-file change.',
+  max: 'Multi-file refactoring, architecture design, performance work, mathematical proofs, security analysis, or concurrency debugging.',
+}
+
 /**
  * 配置 schema。
  *
@@ -54,9 +73,17 @@ const MAX_MODEL_CACHE = 200
  * 没有列在这里的配置字段会被剥掉，所以现有字段必须全部写上。
  */
 export const Config = z.object({
+  // 总开关：关掉就完全不改请求，等同 manual。
+  enabled: z.boolean().default(true).volatile(),
   mode: z.union(MODES).default('auto').volatile(),
-  judgeSource: z.union(JUDGE_SOURCES).default('local'),
+  judgeSource: z.union(JUDGE_SOURCES).default('local').volatile(),
   judgeUrl: z.string().default(DEFAULT_JUDGE).volatile(),
+  // Jev 走决策协议，不是 chat：地址、模型名、凭据引用都要单独配。
+  jevUrl: z.string().default(DEFAULT_JEV_URL).volatile(),
+  jevModel: z.string().default(DEFAULT_JEV_MODEL).volatile(),
+  jevApiKeyEnv: z.string().default(DEFAULT_JEV_API_KEY_ENV).volatile(),
+  jevConfidence: z.number().default(DEFAULT_JEV_CONFIDENCE).volatile(),
+  jevTimeoutMs: z.number().default(JEV_TIMEOUT_MS),
   notify: z.string().default('').volatile(),
   tiers: z.dict(z.string()).volatile(),
   autoStart: z.boolean(),
@@ -99,10 +126,51 @@ export function strengthOf(effort) {
 }
 
 /**
+ * 把模型的档位列表整理成梯子：去掉 off（那是关掉思考，不是一档强度），按强弱排序。
+ */
+export function ladderOf(available) {
+  return (available ?? [])
+    .map((id) => ({ id, index: strengthOf(id) }))
+    .filter((entry) => entry.index !== undefined && String(entry.id).toLowerCase() !== 'off')
+    .sort((left, right) => left.index - right.index)
+    .map((entry) => entry.id)
+}
+
+/**
+ * 把判定的三档按相对位置落到模型自己的梯子上。
+ *
+ * low 取最低档，high 取中间档，max 取最高档。这样每个模型都能用满自己的范围：
+ * deepseek 的三档（low/high/max）落成 low/high/max；
+ * gemini 的三档（low/medium/high）落成 low/medium/high；
+ * minimax 的五档（low/medium/high/xhigh/max）落成 low/high/max。
+ *
+ * 不按名字硬套的理由：名字套会让「没有 max 的模型」把 max 压到 high，
+ * 让「有 xhigh 的模型」永远用不到 medium 与 xhigh。
+ */
+export function pickByLadder(available, tier) {
+  const ladder = ladderOf(available)
+  if (ladder.length === 0) return undefined
+  const last = ladder.length - 1
+  const offset = tier === 'max' ? last : tier === 'low' ? 0 : Math.round(last / 2)
+  return ladder[Math.min(Math.max(offset, 0), last)]
+}
+
+/**
+ * 取本轮要写的强度。
+ *
+ * 默认走位置映射，不需要用户配置。只有用户把 tiers 改成非默认值时才按那张表走，
+ * 保留手工精调的口子。
+ */
+function pickForTier(available, tier, tiers) {
+  const customised = Object.keys(DEFAULT_TIERS).some((key) => (tiers?.[key] ?? DEFAULT_TIERS[key]) !== DEFAULT_TIERS[key])
+  if (customised) return pickEffort(available, tiers[tier] ?? tiers.fallback)
+  return pickByLadder(available, tier)
+}
+/**
  * 在 `available` 里挑一个不超过 `target` 的最强档。
  *
- * 模型全部比 target 强时给最弱那个（例如目标 low，而模型只有 high/max）；
- * available 为空、或全是不认识的强度名时返回 undefined，调用方保持原配置。
+ * 这是「按名字映射」的走法，只在用户手工改过 tiers 时用。
+ * 模型全部比 target 强时给最弱那个；available 为空或全是不认识的强度名时返回 undefined。
  */
 export function pickEffort(available, target) {
   const targetIndex = strengthOf(target)
@@ -537,11 +605,17 @@ export function apply(ctx, config) {
       ? { ...tiers, ...values.tiers }
       : tiers
     return {
+      enabled: typeof values?.enabled === 'boolean' ? values.enabled : valueOf(cfg.enabled, true) !== false,
       mode: MODES.includes(values?.mode) ? values.mode : mode.current,
       judgeSource: JUDGE_SOURCES.includes(values?.judgeSource) ? values.judgeSource : (valueOf(cfg.judgeSource, 'local') === 'jev' ? 'jev' : 'local'),
       judgeUrl: typeof values?.judgeUrl === 'string' && values.judgeUrl !== '' ? values.judgeUrl : mountedJudgeUrl,
       notify: typeof values?.notify === 'string' ? values.notify : String(valueOf(cfg.notify, '') ?? ''),
       tiers: { ...DEFAULT_TIERS, ...tierSource },
+      jevUrl: typeof values?.jevUrl === 'string' && values.jevUrl !== '' ? values.jevUrl : (valueOf(cfg.jevUrl, '') || DEFAULT_JEV_URL),
+      jevModel: typeof values?.jevModel === 'string' && values.jevModel !== '' ? values.jevModel : (valueOf(cfg.jevModel, '') || DEFAULT_JEV_MODEL),
+      jevApiKeyEnv: typeof values?.jevApiKeyEnv === 'string' && values.jevApiKeyEnv !== '' ? values.jevApiKeyEnv : (valueOf(cfg.jevApiKeyEnv, '') || DEFAULT_JEV_API_KEY_ENV),
+      jevConfidence: Number.isFinite(Number(values?.jevConfidence)) ? Number(values.jevConfidence) : toMs(cfg.jevConfidence, DEFAULT_JEV_CONFIDENCE),
+      jevTimeoutMs: toMs(values?.jevTimeoutMs ?? cfg.jevTimeoutMs, JEV_TIMEOUT_MS),
     }
   }
 
@@ -620,14 +694,145 @@ export function apply(ctx, config) {
   }
 
   /**
+   * Jev 的凭据：进程环境优先，其次宿主凭据服务。
+   * 引用名沿用 DSH 的 credential-ref 约定（形如环境变量名）。
+   */
+  async function jevKey(reference) {
+    const name = typeof reference === 'string' && reference !== '' ? reference : DEFAULT_JEV_API_KEY_ENV
+    const fromEnv = process.env[name]
+    if (typeof fromEnv === 'string' && fromEnv !== '') return fromEnv
+    try {
+      const credentials = ctx.get('credentials')
+      if (credentials !== undefined && credentials !== null && typeof credentials.resolve === 'function') {
+        const value = await credentials.resolve(name)
+        if (typeof value === 'string' && value !== '') return value
+      }
+    } catch {
+      /* 凭据服务不可用，按没有 key 处理 */
+    }
+    return ''
+  }
+
+  /** 两个档位里更强的那个，用于低置信度向上取。 */
+  function strongerOf(left, right) {
+    const leftIndex = strengthOf(left)
+    const rightIndex = strengthOf(right)
+    if (leftIndex === undefined) return right
+    if (rightIndex === undefined) return left
+    return rightIndex > leftIndex ? right : left
+  }
+
+  /**
+   * 问 Jev 要一个档位。
+   *
+   * Jev 是决策模型，走 System One 协议：`POST {model, state, questions}`，
+   * 回来的是 `{answers:{effort:{choice, confidence, probabilities}}}`，没有文本、没有推理链。
+   * 置信度低于阈值时在概率最高的两档里取更强的那个：宁可高估，不低估。
+   * 任何失败都返回 null，调用方保持原强度。
+   */
+  async function askJev(task, signal, now) {
+    if (typeof task !== 'string' || task === '') return null
+    const key = await jevKey(now.jevApiKeyEnv)
+    if (key === '') {
+      log('Jev 没有可用凭据，本轮不改强度')
+      return null
+    }
+    const timeout = AbortSignal.timeout(toMs(now.jevTimeoutMs, JEV_TIMEOUT_MS))
+    if (signal && typeof signal.addEventListener === 'function') {
+      signal.addEventListener('abort', () => timeout.abort?.(), { once: true })
+    }
+    try {
+      const response = await fetch(now.jevUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${key}` },
+        body: JSON.stringify({
+          model: now.jevModel,
+          state: task.slice(0, MAX_TASK_CHARS),
+          questions: {
+            effort: {
+              type: 'choice',
+              instructions: 'How much reasoning depth does answering this request need?',
+              criteria: TIER_CRITERIA,
+            },
+          },
+        }),
+        signal: timeout,
+      })
+      if (!response.ok) {
+        log(`Jev 返回 HTTP ${response.status}，本轮不改强度`)
+        return null
+      }
+      const body = await response.json()
+      const answer = body !== null && typeof body === 'object' && body.answers !== undefined ? body.answers.effort : undefined
+      const choice = answer !== null && typeof answer === 'object' && typeof answer.choice === 'string'
+        ? answer.choice.trim().toLowerCase()
+        : ''
+      if (!TIER_KEYS.includes(choice)) {
+        log(`Jev 的答案不是已知档位（${choice === '' ? '空' : choice}），本轮不改强度`)
+        return null
+      }
+      const confidence = Number(answer.confidence)
+      const threshold = Number.isFinite(now.jevConfidence) ? now.jevConfidence : DEFAULT_JEV_CONFIDENCE
+      if (Number.isFinite(confidence) && confidence < threshold) {
+        const probabilities = answer.probabilities !== null && typeof answer.probabilities === 'object' ? answer.probabilities : {}
+        const ranked = Object.entries(probabilities)
+          .filter((entry) => TIER_KEYS.includes(entry[0]))
+          .sort((left, right) => Number(right[1]) - Number(left[1]))
+          .map((entry) => entry[0])
+        if (ranked.length >= 2) {
+          const stronger = strongerOf(ranked[0], ranked[1])
+          trace(`jev 置信度 ${confidence.toFixed(2)} 低于 ${threshold}，取更强的 ${stronger}`)
+          return stronger
+        }
+      }
+      return choice
+    } catch (error) {
+      log(`Jev 不可用（${error && error.message ? error.message : error}），本轮不改强度`)
+      return null
+    }
+  }
+
+  /**
+   * 把这一轮的强度写进会话的模型选择。
+   *
+   * 这是让强度真正到达请求的唯一路径：`dsh-agent` 的 model-selection 监听会在
+   * `agent/request` 上无条件剥掉继承来的 `reasoningEffort`（用户没选档位时清空，
+   * 选了就用那个固定值），只认 `selection.assembled.reasoningEffort`。
+   * 在 pre-step（早于 prompt assemble）把值写进 selection，assemble 时快照进去，
+   * 请求就带着它发出去。实测：不写 selection 时 anthropic 请求体里连 thinking 都没有。
+   *
+   * 服务名在不同运行时可能不同，按顺序试；都没有就返回 false，本轮不改强度。
+   */
+  function applySelection(ctx, agent, provider, model, reasoningEffort) {
+    if (agent === undefined || agent === null) return false
+    for (const name of ['sessionController', 'agents']) {
+      let service
+      try {
+        service = ctx.get(name)
+      } catch {
+        service = undefined
+      }
+      if (service === undefined || service === null) continue
+      const apply = service.selectForNextRequest
+      if (typeof apply !== 'function') continue
+      try {
+        apply.call(service, agent, { provider, model, reasoningEffort })
+        trace(`selection: 写入 ${provider}/${model} → ${reasoningEffort}（via ${name}）`)
+        return true
+      } catch (error) {
+        trace(`selection: 写入失败（${name}）：${error && error.message ? error.message : error}`)
+      }
+    }
+    trace('selection: 没有可用的写入接口，本轮只在内存里改')
+    return false
+  }
+
+  /**
    * 问一次判定器要档位。任何后端失败都返回 null，调用方保持原强度。
    * `now` 是本轮读到的热改值，后端选择与地址都从它取。
    */
   async function askJudge(task, signal, now) {
-    if (now.judgeSource === 'jev') {
-      // 留着的位置：判断型模型 API（Jev）。当前只用本地服务，这里不发起调用。
-      return null
-    }
+    if (now.judgeSource === 'jev') return askJev(task, signal, now)
     return judgeTier(now.judgeUrl, task, signal, judge)
   }
 
@@ -763,7 +968,7 @@ export function apply(ctx, config) {
   ctx.on('agent/request', async (payload, next) => {
     const base = await next()
     const now = live()
-    if (now.mode === 'manual') return base
+    if (!now.enabled || now.mode === 'manual') return base
     if (!base || !base.provider || !base.model) return base
     // 子代理的强度跟主代理走，这里不覆盖。
     if (isSubagent(payload)) return base
@@ -785,9 +990,10 @@ export function apply(ctx, config) {
       }
       if (tier === null || tier === undefined) return base
 
-      const target = now.tiers[tier] ?? now.tiers.fallback
-      const picked = pickEffort(await effortsFor(base.provider, base.model), target)
+      const picked = pickForTier(await effortsFor(base.provider, base.model), tier, now.tiers)
       if (picked === undefined) return base
+      // 兜底层：有 model-selection 的运行时会把这里写的值剥掉，真正生效的是 pre-step
+      // 写进会话选择的那份。没有 model-selection 的运行时靠这一层。
 
       // 上一轮之后强度被改过，说明是用户自己拧的：这时只升不降。
       const previous = written.get(key)
@@ -801,7 +1007,7 @@ export function apply(ctx, config) {
       written.set(key, { turn, effort })
       recordVerdict(key, tier, effort, base.provider, base.model, turnOf(payload))
       if (effort === base.reasoningEffort) return base
-      log(`turn ${turn} ${tier} -> ${target} => ${effort}（${base.provider}/${base.model}）`)
+      log(`turn ${turn} ${tier} => ${effort}（${base.provider}/${base.model}）`)
       return { ...base, reasoningEffort: effort }
     } catch (error) {
       log(`本轮跳过（${error && error.message ? error.message : error}）`)
@@ -815,28 +1021,31 @@ export function apply(ctx, config) {
   ctx.on('agent/pre-step', async (payload, next) => {
     const decision = await next()
     const now = live()
-    if (now.mode === 'manual' || now.notify === 'off') return decision
+    if (!now.enabled || now.mode === 'manual') return decision
     if (decision.kind === 'reject') return decision
     if (payload.step !== 1) return decision
     try {
       const route = currentRoute(ctx, payload)
       if (route === undefined) {
         // 拿不到本轮模型时插不了提示（提示里要写模型名）。留一行痕迹，免得像“没生效”。
-        trace('pre-step: 拿不到本轮模型，跳过提示')
+        trace('pre-step: 拿不到本轮模型，跳过')
         return decision
       }
       const key = sessionKey(payload)
       const tier = await askJudge(tasks.get(key), payload.signal, now)
       if (tier === null) return decision
       pending.set(key, tier)
-      const effort = pickEffort(await effortsFor(route.provider, route.model), now.tiers[tier] ?? now.tiers.fallback)
+      const effort = pickForTier(await effortsFor(route.provider, route.model), tier, now.tiers)
       if (effort === undefined) return decision
-      if (now.notify !== 'always' && effort === route.reasoningEffort) return decision
+      // 先写会话选择：这一步决定请求里到底带不带强度，与要不要插提示无关。
+      applySelection(ctx, payload.agent, route.provider, route.model, effort)
       recordVerdict(key, tier, effort, route.provider, route.model, turnOf(payload))
+      if (now.notify === 'off') return decision
+      if (now.notify !== 'always' && effort === route.reasoningEffort) return decision
       trace(`pre-step: 插入提示 ${tier} -> ${effort}（${route.provider}/${route.model}）`)
       return { ...decision, messages: [...decision.messages, notice(tier, effort, route.provider, route.model)] }
     } catch (error) {
-      log(`提示生成失败（${error && error.message ? error.message : error}）`)
+      log(`判定失败（${error && error.message ? error.message : error}）`)
       return decision
     }
   }, { global: true, prepend: true })
@@ -888,6 +1097,7 @@ export function apply(ctx, config) {
     /** 把改动写回 profile。这是设置页保存的唯一落盘路径；没有设置面时退回内存开关。 */
     const writeConfig = async (patch) => {
       const clean = {}
+      if (typeof patch.enabled === 'boolean') clean.enabled = patch.enabled
       if (MODES.includes(patch.mode)) clean.mode = patch.mode
       if (JUDGE_SOURCES.includes(patch.judgeSource)) clean.judgeSource = patch.judgeSource
       if (typeof patch.judgeUrl === 'string' && patch.judgeUrl !== '') {
@@ -904,6 +1114,29 @@ export function apply(ctx, config) {
         clean.judgeUrl = parsed.toString()
       }
       if (patch.notify === '' || patch.notify === 'off' || patch.notify === 'always') clean.notify = patch.notify
+      if (typeof patch.jevUrl === 'string' && patch.jevUrl !== '') {
+        let parsed
+        try {
+          parsed = new URL(patch.jevUrl)
+        } catch {
+          parsed = undefined
+        }
+        if (parsed === undefined || (parsed.protocol !== 'http:' && parsed.protocol !== 'https:')) {
+          return { ok: false, detail: 'jevUrl 必须是 http(s) 地址' }
+        }
+        clean.jevUrl = parsed.toString()
+      }
+      if (typeof patch.jevModel === 'string' && patch.jevModel !== '') clean.jevModel = patch.jevModel
+      if (typeof patch.jevApiKeyEnv === 'string' && /^[A-Za-z_][A-Za-z0-9_]*$/.test(patch.jevApiKeyEnv)) {
+        clean.jevApiKeyEnv = patch.jevApiKeyEnv
+      }
+      if (patch.jevConfidence !== undefined && patch.jevConfidence !== null) {
+        const value = Number(patch.jevConfidence)
+        if (!Number.isFinite(value) || value < 0 || value > 1) {
+          return { ok: false, detail: 'jevConfidence 必须在 0 到 1 之间' }
+        }
+        clean.jevConfidence = value
+      }
       if (patch.tiers !== undefined && patch.tiers !== null && typeof patch.tiers === 'object') {
         const next = {}
         for (const key of TIER_KEYS) {
@@ -1011,13 +1244,17 @@ export function apply(ctx, config) {
       }
       let provider = ''
       let model = ''
+      let tier = ''
       try {
         const query = new URL(typeof req.url === 'string' ? req.url : '/', 'http://127.0.0.1').searchParams
         provider = query.get('provider') || ''
         model = query.get('model') || ''
+        tier = (query.get('tier') || '').toLowerCase()
+        if (!TIER_KEYS.includes(tier)) tier = ''
       } catch {
         provider = ''
         model = ''
+        tier = ''
       }
       if (provider === '' || model === '' || provider.length > MAX_QUERY_LENGTH || model.length > MAX_QUERY_LENGTH) {
         send(400, { error: 'provider and model are required, at most 200 characters each' })
@@ -1026,7 +1263,20 @@ export function apply(ctx, config) {
       void (async () => {
         try {
           const efforts = await effortsFor(provider, model)
-          send(200, { provider, model, efforts, ttlMs: toMs(cfg.modelInfoTtlMs, 60000) })
+          let picked
+          try {
+            picked = tier === '' ? undefined : pickForTier(efforts, tier, live().tiers)
+          } catch {
+            picked = undefined
+          }
+          send(200, {
+            provider,
+            model,
+            efforts,
+            // 带上 tier 时回这个档位实际会写成什么强度，方便核对位置映射。
+            ...(tier === '' ? {} : { tier, picked }),
+            ttlMs: toMs(cfg.modelInfoTtlMs, 60000),
+          })
         } catch (error) {
           send(500, { error: error && error.message ? error.message : String(error) })
         }

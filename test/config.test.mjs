@@ -179,6 +179,28 @@ const routeOf = (ctx, path) => ctx.routes.find((entry) => entry.path === path)
   check('judgeUrl: 合法地址接受', good.code, 200)
 }
 
+// 总开关：关掉之后完全不改请求，打开恢复
+{
+  const ctx = fakeContext()
+  apply(ctx, { mode: 'auto', judgeUrl, startupWaitMs: 0, provision: false })
+  const route = routeOf(ctx, '/effort-router/config')
+
+  const off = await call(route, 'POST', { enabled: false })
+  check('开关: 保存成功', off.code, 200)
+  check('开关: 回读为关', off.body.config.enabled, false)
+
+  const agent = { session: { id: 'session-switch', requestHeader: () => ({ config: { provider: 'p', model: 'm' } }) } }
+  ctx.handlers.get('agent/inbox/claimed')({ agent, message: { content: [{ type: 'text', text: '重构这段代码' }] } })
+  const closed = await ctx.handlers.get('agent/request')({ agent, turn: 1, step: 1 },
+    async () => ({ provider: 'p', model: 'm', reasoningEffort: 'low' }))
+  check('开关: 关掉后不改强度', closed.reasoningEffort, 'low')
+
+  await call(route, 'POST', { enabled: true })
+  const opened = await ctx.handlers.get('agent/request')({ agent, turn: 2, step: 1 },
+    async () => ({ provider: 'p', model: 'm', reasoningEffort: 'low' }))
+  check('开关: 打开后恢复', opened.reasoningEffort, 'high')
+}
+
 // 没有设置面：只读，mode 退回内存开关
 {
   const ctx = fakeContext({ settings: false })
