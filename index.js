@@ -31,12 +31,14 @@ const SETUP_LOG_PATH = `${tmpdir()}/router-effort-setup.log`
 /** 挂载痕迹。宿主没有稳定的 stderr 落盘，这里记一行，重启后能确认插件到底有没有挂上。 */
 const MOUNT_LOG_PATH = `${tmpdir()}/router-effort.log`
 
-/** 判定后端。local 走本机服务；jev 是留给判断型模型 API 的位置，当前不发起调用。 */
+/** 判定后端。local 走本机服务；jev 走 TokenFlux 中转的 System One 决策端点。 */
 const JUDGE_SOURCES = ['local', 'jev']
 const MODES = ['auto', 'manual']
 
 /** 档位到强度名的默认映射，也是页面里那四个下拉的名字。 */
 const TIER_KEYS = ['low', 'high', 'max', 'fallback']
+/** 判定后端真正会回的档位。fallback 只是映射表的一个键，不是判定结果。 */
+const JUDGE_TIERS = ['low', 'high', 'max']
 const DEFAULT_TIERS = { low: 'low', high: 'high', max: 'max', fallback: 'low' }
 /** 最近判定的保留条数。落盘和芯片列表都用它。 */
 const MAX_RECENT = 100
@@ -699,17 +701,24 @@ export function apply(ctx, config) {
    */
   async function jevKey(reference) {
     const name = typeof reference === 'string' && reference !== '' ? reference : DEFAULT_JEV_API_KEY_ENV
-    const fromEnv = process.env[name]
-    if (typeof fromEnv === 'string' && fromEnv !== '') return fromEnv
+    // 顺序跟宿主凭据服务一致：文件优先，环境变量兜底。
+    // 反过来的话，面板写进凭据库的 Key 会被同名环境变量盖住，状态显示与实际生效对不上。
     try {
       const credentials = ctx.get('credentials')
       if (credentials !== undefined && credentials !== null && typeof credentials.resolve === 'function') {
-        const value = await credentials.resolve(name)
-        if (typeof value === 'string' && value !== '') return value
+        // 宿主凭据服务返回的是 { value, source }，不是裸字符串；两种形状都收。
+        const resolved = await credentials.resolve(name)
+        if (typeof resolved === 'string' && resolved !== '') return resolved
+        if (resolved !== null && typeof resolved === 'object'
+          && typeof resolved.value === 'string' && resolved.value !== '') {
+          return resolved.value
+        }
       }
     } catch {
-      /* 凭据服务不可用，按没有 key 处理 */
+      /* 凭据服务不可用，退到环境变量 */
     }
+    const fromEnv = process.env[name]
+    if (typeof fromEnv === 'string' && fromEnv !== '') return fromEnv
     return ''
   }
 
@@ -825,6 +834,190 @@ export function apply(ctx, config) {
     }
     trace('selection: 没有可用的写入接口，本轮只在内存里改')
     return false
+  }
+
+  /** 面板专用引用名：Jev 的 Key 单独存，不碰 TokenFlux provider 共用的那个。 */
+  const PANEL_KEY_REF = 'TOKENFLUX_JEV_KEY'
+  /** 旧默认名。它与 provider 的 apiKeyEnv 共用，面板不往这里写。 */
+  const SHARED_KEY_REF = 'TOKENFLUX_API_KEY'
+
+  /**
+   * 面板里填的 Key 落到哪个凭据引用上。
+   * UI 不再暴露引用名，只跟已保存的配置走；没有配置时用默认名。
+   */
+  function keyRef(now) {
+    return typeof now?.jevApiKeyEnv === 'string' && now.jevApiKeyEnv !== '' ? now.jevApiKeyEnv : DEFAULT_JEV_API_KEY_ENV
+  }
+
+  /**
+   * 面板写入的目标引用。
+   *
+   * 旧配置的引用名是 TOKENFLUX_API_KEY，那是 TokenFlux provider 也在用的 key：
+   * 把 Jev 的 key 写进去会把模型通道顶掉。遇到它就转到 Jev 专用名，并把配置改过去。
+   */
+  function panelKeyRef(now) {
+    const ref = keyRef(now)
+    return ref === SHARED_KEY_REF ? PANEL_KEY_REF : ref
+  }
+
+  /** 宿主凭据服务；没有 set 能力时当作不可写。 */
+  function credentialsService() {
+    try {
+      const service = ctx.get('credentials')
+      return service !== undefined && service !== null ? service : undefined
+    } catch {
+      return undefined
+    }
+  }
+
+  /**
+   * Key 的状态：只报「有没有、从哪来」，不回传值。
+   * 描述失败当成未配置，面板据此显示「未配置」。
+   */
+  async function keyStatus(now) {
+    const ref = panelKeyRef(now)
+    const service = credentialsService()
+    let described
+    try {
+      described = service !== undefined && typeof service.describe === 'function' ? await service.describe(ref) : undefined
+    } catch {
+      described = undefined
+    }
+    return {
+      ref,
+      configured: described?.configured === true,
+      source: typeof described?.source === 'string' ? described.source : null,
+      writable: service !== undefined && typeof service.set === 'function',
+    }
+  }
+
+  /** 把 Key 写进凭据库。值只进不返，失败带原因。 */
+  async function saveKey(now, value) {
+    const current = keyRef(now)
+    const ref = panelKeyRef(now)
+    const service = credentialsService()
+    if (service === undefined || typeof service.set !== 'function') {
+      return { ok: false, code: 503, detail: '宿主没有可写的凭据服务，Key 存不进去' }
+    }
+    // 引用名会被写进凭据文件，文法不对会让整份文件解析失败，先挡住。
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(ref)) {
+      return { ok: false, code: 400, detail: `凭据名不合法：${ref}` }
+    }
+    try {
+      await service.set(ref, value)
+      trace(`credentials: 写入 ${ref}`)
+    } catch (error) {
+      const message = error && error.message ? String(error.message) : String(error)
+      // 报错原样回浏览器前先把 Key 值抹掉，换别的凭据实现也不会把值带出去。
+      return { ok: false, code: 503, detail: `凭据写入失败：${message.split(value).join('***')}` }
+    }
+    // 引用名换过就落回配置，否则判定还在读旧名字，Key 看似保存其实不生效。
+    if (ref !== current) {
+      try {
+        const settings = ctx.get('settings')
+        if (settings !== undefined && settings !== null && typeof settings.update === 'function') {
+          await settings.update(entryId, { jevApiKeyEnv: ref })
+        }
+      } catch {
+        /* 设置面写不进去时，本轮已经写进凭据库，下次保存再对齐 */
+      }
+    }
+    return { ok: true }
+  }
+
+  /** 凭据文件的位置：DSH_HOME 优先，没有就用 ~/.dsh。 */
+  function credentialsPath() {
+    const home = typeof process.env.DSH_HOME === 'string' && process.env.DSH_HOME.trim() !== ''
+      ? process.env.DSH_HOME.trim()
+      : join(homedir(), '.dsh')
+    return join(home, '.credentials.yaml')
+  }
+
+  /**
+   * 用系统默认程序打开凭据文件。
+   *
+   * 路径写死在这一个文件上：不接受调用方传路径，避免变成「打开任意文件」的口子。
+   */
+  function openCredentials() {
+    const path = credentialsPath()
+    if (!existsSync(path)) return { ok: false, code: 404, detail: `找不到凭据文件：${path}` }
+    const command = process.platform === 'win32'
+      ? { file: 'cmd', args: ['/c', 'start', '', path] }
+      : process.platform === 'darwin'
+        ? { file: 'open', args: [path] }
+        : { file: 'xdg-open', args: [path] }
+    try {
+      const child = spawn(command.file, command.args, { detached: true, stdio: 'ignore', windowsHide: true })
+      child.unref()
+      return { ok: true, path }
+    } catch (error) {
+      return { ok: false, code: 503, detail: error && error.message ? error.message : String(error) }
+    }
+  }
+
+  /**
+   * 探一次当前判定后端能不能答得上话。
+   *
+   * 与真实判定走同一条路径、同一套凭据解析，只是任务换成一句没意义的话。
+   * 设置页的「测试」按钮调它，省得用户只能靠发一条消息才知道配置对不对。
+   * 任何失败都折成 `{ok:false, detail}`，不抛。
+   */
+  async function probeBackend(now) {
+    const started = Date.now()
+    const ms = () => Date.now() - started
+
+    if (now.judgeSource === 'jev') {
+      const key = await jevKey(now.jevApiKeyEnv)
+      if (key === '') {
+        return { ok: false, backend: 'jev', detail: `没有可用凭据：${now.jevApiKeyEnv} 既不在环境变量里，也不在凭据服务里`, ms: ms() }
+      }
+      try {
+        const response = await fetch(now.jevUrl, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${key}` },
+          body: JSON.stringify({
+            model: now.jevModel,
+            state: '探测：把两个整数相加',
+            questions: {
+              effort: {
+                type: 'choice',
+                instructions: 'How much reasoning depth does answering this request need?',
+                criteria: TIER_CRITERIA,
+              },
+            },
+          }),
+          signal: AbortSignal.timeout(toMs(now.jevTimeoutMs, JEV_TIMEOUT_MS)),
+        })
+        if (!response.ok) return { ok: false, backend: 'jev', detail: `HTTP ${response.status}`, ms: ms() }
+        const body = await response.json()
+        const answer = body !== null && typeof body === 'object' && body.answers !== undefined ? body.answers.effort : undefined
+        const choice = answer !== null && typeof answer === 'object' ? answer.choice : undefined
+        if (typeof choice !== 'string') return { ok: false, backend: 'jev', detail: '响应里没有 answers.effort.choice', ms: ms() }
+        return { ok: true, backend: 'jev', detail: `返回档位 ${choice}`, ms: ms() }
+      } catch (error) {
+        return { ok: false, backend: 'jev', detail: error && error.message ? error.message : String(error), ms: ms() }
+      }
+    }
+
+    try {
+      const response = await fetch(now.judgeUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ task: '探测：把两个整数相加' }),
+        signal: AbortSignal.timeout(JUDGE_TIMEOUT_MS),
+      })
+      if (!response.ok) return { ok: false, backend: 'local', detail: `HTTP ${response.status}`, ms: ms() }
+      const body = await response.json()
+      const tier = body !== null && typeof body === 'object' && typeof body.tier === 'string' ? body.tier.trim() : ''
+      if (tier === '') return { ok: false, backend: 'local', detail: '响应里没有 tier', ms: ms() }
+      // 只有认识的档位才算连通：回了句别的字符串照样跑不动。
+      if (!JUDGE_TIERS.includes(tier)) {
+        return { ok: false, backend: 'local', detail: `档位不认识：${tier}`, ms: ms() }
+      }
+      return { ok: true, backend: 'local', detail: `返回档位 ${tier}`, ms: ms() }
+    } catch (error) {
+      return { ok: false, backend: 'local', detail: error && error.message ? error.message : String(error), ms: ms() }
+    }
   }
 
   /**
@@ -1094,8 +1287,13 @@ export function apply(ctx, config) {
       })
     }
 
-    /** 把改动写回 profile。这是设置页保存的唯一落盘路径；没有设置面时退回内存开关。 */
+    /**
+     * 把改动写回 profile。这是设置页保存的唯一落盘路径；没有设置面时退回内存开关。
+     *
+     * 失败分两类：字段本身不合法回 400，设置服务写不进去回 503。两者都带 detail。
+     */
     const writeConfig = async (patch) => {
+      const invalid = (detail) => ({ ok: false, invalid: true, detail })
       const clean = {}
       if (typeof patch.enabled === 'boolean') clean.enabled = patch.enabled
       if (MODES.includes(patch.mode)) clean.mode = patch.mode
@@ -1109,7 +1307,7 @@ export function apply(ctx, config) {
           parsed = undefined
         }
         if (parsed === undefined || (parsed.protocol !== 'http:' && parsed.protocol !== 'https:')) {
-          return { ok: false, detail: 'judgeUrl 必须是 http(s) 地址' }
+          return invalid('judgeUrl 必须是 http(s) 地址')
         }
         clean.judgeUrl = parsed.toString()
       }
@@ -1122,18 +1320,21 @@ export function apply(ctx, config) {
           parsed = undefined
         }
         if (parsed === undefined || (parsed.protocol !== 'http:' && parsed.protocol !== 'https:')) {
-          return { ok: false, detail: 'jevUrl 必须是 http(s) 地址' }
+          return invalid('jevUrl 必须是 http(s) 地址')
         }
         clean.jevUrl = parsed.toString()
       }
       if (typeof patch.jevModel === 'string' && patch.jevModel !== '') clean.jevModel = patch.jevModel
-      if (typeof patch.jevApiKeyEnv === 'string' && /^[A-Za-z_][A-Za-z0-9_]*$/.test(patch.jevApiKeyEnv)) {
+      if (typeof patch.jevApiKeyEnv === 'string' && patch.jevApiKeyEnv !== '') {
+        if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(patch.jevApiKeyEnv)) {
+          return invalid('凭据名只能包含字母、数字、下划线，且不能以数字开头')
+        }
         clean.jevApiKeyEnv = patch.jevApiKeyEnv
       }
       if (patch.jevConfidence !== undefined && patch.jevConfidence !== null) {
         const value = Number(patch.jevConfidence)
         if (!Number.isFinite(value) || value < 0 || value > 1) {
-          return { ok: false, detail: 'jevConfidence 必须在 0 到 1 之间' }
+          return invalid('jevConfidence 必须在 0 到 1 之间')
         }
         clean.jevConfidence = value
       }
@@ -1143,13 +1344,13 @@ export function apply(ctx, config) {
           const value = patch.tiers[key]
           if (value === undefined) continue
           if (typeof value !== 'string' || strengthOf(value) === undefined) {
-            return { ok: false, detail: `档位 ${key} 的强度名不认识：${String(value)}` }
+            return invalid(`档位 ${key} 的强度名不认识：${String(value)}`)
           }
           next[key] = value
         }
         if (Object.keys(next).length > 0) clean.tiers = next
       }
-      if (Object.keys(clean).length === 0) return { ok: false, detail: '没有可写的字段' }
+      if (Object.keys(clean).length === 0) return invalid('没有可写的字段')
       let settings
       try {
         settings = ctx.get('settings')
@@ -1223,7 +1424,7 @@ export function apply(ctx, config) {
         }
         const outcome = await writeConfig({ mode: body.mode })
         if (!outcome.ok) {
-          send(503, outcome)
+          send(outcome.invalid === true ? 400 : 503, outcome)
           return
         }
         send(200, { mode: live().mode, persisted: outcome.persisted === true })
@@ -1366,11 +1567,136 @@ export function apply(ctx, config) {
       collectJson(req, send, async (body) => {
         const outcome = await writeConfig(body)
         if (!outcome.ok) {
-          send(503, outcome)
+          send(outcome.invalid === true ? 400 : 503, outcome)
           return
         }
         send(200, { ok: true, persisted: outcome.persisted === true, config: readConfig() })
       })
+    }
+    /**
+     * 同源检查：探活、写 Key、开文件这类动作只接受本页发起的请求。
+     * 跨站页面即使能发 JSON，也过不了这一关；curl 之类不带这些头的不受影响。
+     */
+    const sameOrigin = (req) => {
+      const headers = req !== null && typeof req === 'object' && req.headers !== undefined ? req.headers : {}
+      const site = String(headers['sec-fetch-site'] ?? '')
+      if (site !== '' && site !== 'same-origin' && site !== 'none') return false
+      const origin = String(headers.origin ?? '')
+      if (origin === '') return true
+      try {
+        return new URL(origin).host === String(headers.host ?? '')
+      } catch {
+        return false
+      }
+    }
+    const probeHandler = (req, res) => {
+      const send = (code, body) => {
+        const text = JSON.stringify(body)
+        res.statusCode = code
+        res.setHeader('Content-Type', 'application/json; charset=utf-8')
+        res.setHeader('Content-Length', String(Buffer.byteLength(text)))
+        res.end(text)
+      }
+      if (req.method !== 'POST') {
+        send(405, { error: 'method not allowed' })
+        return
+      }
+      if (!sameOrigin(req)) {
+        send(403, { ok: false, detail: '只接受本页发起的探活' })
+        return
+      }
+      collectJson(req, send, async (body) => {
+        const now = live()
+        const wanted = { ...now }
+        // 只允许切换后端与模型名：地址一律用已保存的。
+        // 否则任何页面都能借这个接口把 Bearer 凭据发到它自己指定的 URL。
+        if (JUDGE_SOURCES.includes(body.judgeSource)) wanted.judgeSource = body.judgeSource
+        if (typeof body.jevModel === 'string' && body.jevModel !== '') wanted.jevModel = body.jevModel
+        // 地址守卫只比当前后端那一条，且按规范化后的 URL 比：
+        // 换个大小写、补个默认端口都还是同一个地址，不该拦；另一条地址改没改与本次测试无关。
+        const sameUrl = (left, right) => {
+          try {
+            return new URL(left).toString() === new URL(right).toString()
+          } catch {
+            return false
+          }
+        }
+        if (wanted.judgeSource === 'local' && typeof body.judgeUrl === 'string' && body.judgeUrl !== ''
+          && !sameUrl(body.judgeUrl, now.judgeUrl)) {
+          send(200, { ok: false, backend: 'local', detail: '地址改过还没保存，先保存再测试', ms: 0 })
+          return
+        }
+        if (wanted.judgeSource === 'jev' && typeof body.jevUrl === 'string' && body.jevUrl !== ''
+          && !sameUrl(body.jevUrl, now.jevUrl)) {
+          send(200, { ok: false, backend: 'jev', detail: '地址改过还没保存，先保存再测试', ms: 0 })
+          return
+        }
+        send(200, await probeBackend(wanted))
+      })
+    }
+    /** Key：GET 报状态（不含值），POST 写进凭据库。 */
+    const keyHandler = (req, res) => {
+      const send = (code, body) => {
+        const text = JSON.stringify(body)
+        res.statusCode = code
+        res.setHeader('Content-Type', 'application/json; charset=utf-8')
+        res.setHeader('Content-Length', String(Buffer.byteLength(text)))
+        res.end(text)
+      }
+      if (req.method === 'GET') {
+        void keyStatus(live()).then((status) => send(200, status))
+        return
+      }
+      if (req.method !== 'POST') {
+        send(405, { error: 'method not allowed' })
+        return
+      }
+      if (!sameOrigin(req)) {
+        send(403, { ok: false, detail: '只接受本页发起的写入' })
+        return
+      }
+      collectJson(req, send, async (body) => {
+        const value = typeof body.key === 'string' ? body.key.trim() : ''
+        if (value === '') {
+          send(400, { ok: false, detail: 'Key 不能为空' })
+          return
+        }
+        if (value.length > 4096) {
+          send(400, { ok: false, detail: 'Key 太长，不像是有效值' })
+          return
+        }
+        const outcome = await saveKey(live(), value)
+        if (!outcome.ok) {
+          send(outcome.code ?? 503, { ok: false, detail: outcome.detail })
+          return
+        }
+        send(200, { ok: true, ...(await keyStatus(live())) })
+      })
+    }
+    /** 用系统默认程序打开凭据文件。路径固定在凭据文件上，不接受调用方传入。 */
+    const openCredentialsHandler = (req, res) => {
+      const send = (code, body) => {
+        const text = JSON.stringify(body)
+        res.statusCode = code
+        res.setHeader('Content-Type', 'application/json; charset=utf-8')
+        res.setHeader('Content-Length', String(Buffer.byteLength(text)))
+        res.end(text)
+      }
+      if (req.method !== 'POST') {
+        send(405, { error: 'method not allowed' })
+        return
+      }
+      if (!sameOrigin(req)) {
+        send(403, { ok: false, detail: '只接受本页发起的打开请求' })
+        return
+      }
+      const outcome = openCredentials()
+      if (!outcome.ok) {
+        send(outcome.code ?? 503, { ok: false, detail: outcome.detail })
+        return
+      }
+      trace(`打开凭据文件：${outcome.path}`)
+      send(200, { ok: true, path: outcome.path })
     }
     for (const path of ['/effort-router/judge', '/router-effort/judge']) {
       scoped.effect(() => webServer.register({ kind: 'exact', path, handler: judgeHandler }))
@@ -1389,6 +1715,15 @@ export function apply(ctx, config) {
     }
     for (const path of ['/effort-router/seen', '/router-effort/seen']) {
       scoped.effect(() => webServer.register({ kind: 'exact', path, handler: seenHandler }))
+    }
+    for (const path of ['/effort-router/probe', '/router-effort/probe']) {
+      scoped.effect(() => webServer.register({ kind: 'exact', path, handler: probeHandler }))
+    }
+    for (const path of ['/effort-router/key', '/router-effort/key']) {
+      scoped.effect(() => webServer.register({ kind: 'exact', path, handler: keyHandler }))
+    }
+    for (const path of ['/effort-router/open-credentials', '/router-effort/open-credentials']) {
+      scoped.effect(() => webServer.register({ kind: 'exact', path, handler: openCredentialsHandler }))
     }
   })
 }

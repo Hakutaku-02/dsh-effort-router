@@ -192,14 +192,27 @@ curl http://127.0.0.1:<GUI 端口>/effort-router/judge
 | --- | --- |
 | 路由开关 | 开启 / 关闭。关掉后完全不改请求，等同手动模式 |
 | 判定方式 | 本地服务 / Jev。选 Jev 时展开下面四项 |
-| Jev 配置 | 地址、模型名、凭据引用名、置信度阈值 |
+| Jev 配置 | 地址、模型名、API Key、置信度阈值；Key 存进凭据库，面板只显示「已配置 / 未配置」 |
 | 模式 | 自动 / 手动（与总开关叠加：任一为关就不改请求） |
 | 判定服务 | 本地判定服务的地址 |
-| 对话提示 | 不提示 / 每轮都提示 |
+| 对话提示 | 变化时提示 / 每轮都提示 / 不提示 |
 | 档位映射 | 简单 / 中等 / 困难 / 兜底 四个下拉 |
 
-保存写回 profile 的 `cordis.patch.yml`。`enabled`、`mode`、`judgeUrl`、`notify`、`tiers`、`jevUrl`、
-`jevModel`、`jevApiKeyEnv`、`jevConfidence` 都标了 volatile，改完即时生效；其余字段下次重启生效。
+页面行为：
+
+- 「保存」没有改动时是禁用的（灰掉），改动后才可点。提示文字 3 秒后自动消失。
+- 判定地址、Jev 地址、模型名都是必填：清空后点保存只给提示，不发请求，不会被宿主回写悄悄还原。
+- 置信度阈值留空或超出 0 到 1 也不保存，避免空值被当成 0 静默生效。
+- Key 输入框不回显已有值：留空表示不改，填了就写进 `~/.dsh/.credentials.yaml` 的 `TOKENFLUX_JEV_KEY`。
+  旧配置若还指着 `TOKENFLUX_API_KEY`（TokenFlux provider 共用的那个），写入时自动转到专用名并改配置，不会顶掉模型通道的 key。
+- 「打开凭据文件」用系统默认程序打开 `.credentials.yaml`。DSH 顶栏自带的「打开配置文件」打开的是 profile 补丁，属于宿主，本插件不改它。
+- 「测试」按**表单里当前的**后端与模型名发一次最小请求，凭据用已保存的那条；改过地址要先保存再测。
+- 四组切换按钮都带 `role="group"` 与 `aria-pressed`，读屏与脚本能判断当前选中项。
+- 档位下拉只列真实的思考档（不含 `off`：`off` 在这套实现里不会关掉思考，只会落到最低档）。
+  老配置里若存了 `off`，载入时归一化成默认值。选了当前模型不支持的档，会退到最接近的较低档。
+
+保存写回 profile 的 `cordis.patch.yml`。`enabled`、`mode`、`judgeSource`、`judgeUrl`、`notify`、`tiers`、
+`jevUrl`、`jevModel`、`jevApiKeyEnv`、`jevConfidence` 都标了 volatile，改完即时生效；其余字段下次重启生效。
 
 页面不直接读写 profile：它调插件自己的 `/effort-router/config`，由宿主半边转成 `settings.update`。
 宿主没有设置面时页面只读，保存退化成只改内存里的模式。
@@ -273,7 +286,7 @@ curl -X POST http://127.0.0.1:<GUI 端口>/effort-router/config \
 | `judgeSource` | `local` | 判定后端。`local` 走本机服务；`jev` 走 Jev 决策模型 |
 | `jevUrl` | `https://tokenflux.dev/v1/systemone` | Jev 的决策端点，只接受 http(s) |
 | `jevModel` | `jev-latest` | Jev 的模型名 |
-| `jevApiKeyEnv` | `TOKENFLUX_API_KEY` | 凭据引用名，先查进程环境再查宿主凭据服务 |
+| `jevApiKeyEnv` | `TOKENFLUX_API_KEY` | 凭据引用名，面板写入 Key 时落到这里；先查进程环境再查宿主凭据服务 |
 | `jevConfidence` | `0.6` | 置信度阈值，低于它在最高的两档里取更强的 |
 | `jevTimeoutMs` | `12000` | Jev 请求超时 |
 | `startupWaitMs` | `3000` | 启动时等判定服务就绪的上限 |
@@ -303,6 +316,25 @@ curl -X POST http://127.0.0.1:<GUI 端口>/effort-router/mode -H "Content-Type: 
 curl "http://127.0.0.1:<GUI 端口>/effort-router/last"
 curl "http://127.0.0.1:<GUI 端口>/effort-router/last?session=<会话 id>"
 ```
+
+`key` 路由给面板里的 Key 输入框用：`GET` 只报状态（`{ref, configured, source, writable}`），`POST {key}` 写进宿主凭据库，值不回传。
+
+```bash
+curl http://127.0.0.1:<GUI 端口>/effort-router/key
+curl -X POST http://127.0.0.1:<GUI 端口>/effort-router/key -H "Content-Type: application/json" -d "{\"key\":\"sk-...\"}"
+```
+
+`open-credentials` 路由不接受参数，只打开 `DSH_HOME/.credentials.yaml`（默认 `~/.dsh/.credentials.yaml`）。
+
+`probe` 路由是设置页「测试」按钮的后端，真发一次最小请求，返回 `{ok, backend, detail, ms}`：
+
+```bash
+curl -X POST http://127.0.0.1:<GUI 端口>/effort-router/probe -H "Content-Type: application/json" -d "{}"
+```
+
+只接受切换后端与模型名（`judgeSource`、`jevModel`）；地址一律用已保存的值。请求里带了与已保存不同的
+`judgeUrl` / `jevUrl` 时直接回「先保存再测试」，不发请求——否则任何页面都能借这个接口把 Bearer 凭据
+发到它自己指定的地址。
 
 改代码要重启 DSH 才生效。
 

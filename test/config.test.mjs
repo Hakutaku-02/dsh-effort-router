@@ -20,6 +20,11 @@ const judge = createServer((req, res) => {
     res.end(JSON.stringify({ protocol: 'finetuned' }))
     return
   }
+  // 探活要能识破「连得上但回的档位不认识」。
+  if (req.url === '/odd') {
+    res.end(JSON.stringify({ tier: 'turbo' }))
+    return
+  }
   res.end(JSON.stringify({ tier: 'high' }))
 })
 await new Promise((resolve) => judge.listen(0, '127.0.0.1', resolve))
@@ -144,7 +149,7 @@ const routeOf = (ctx, path) => ctx.routes.find((entry) => entry.path === path)
   check('档位: 默认 high', before.body.tiers.high, 'high')
 
   const bad = await call(routeOf(ctx, '/effort-router/config'), 'POST', { tiers: { max: 'turbo' } })
-  check('档位: 非法强度被拒', bad.code, 503)
+  check('档位: 非法强度被拒', bad.code, 400)
   check('档位: 拒时不写', ctx.updates.length, 0)
 
   const saved = await call(routeOf(ctx, '/effort-router/config'), 'POST', { tiers: { high: 'low' } })
@@ -170,10 +175,10 @@ const routeOf = (ctx, path) => ctx.routes.find((entry) => entry.path === path)
   check('跨站写: 没落盘', ctx.updates.length, 0)
 
   const fileUrl = await call(route, 'POST', { judgeUrl: 'file:///etc/passwd' })
-  check('judgeUrl: 非 http(s) 被拒', fileUrl.code, 503)
+  check('judgeUrl: 非 http(s) 被拒', fileUrl.code, 400)
 
   const badNotify = await call(route, 'POST', { notify: '随时' })
-  check('notify: 非法值被忽略', badNotify.code, 503)
+  check('notify: 非法值被拒', badNotify.code, 400)
 
   const good = await call(route, 'POST', { judgeUrl: 'https://example.com/judge' })
   check('judgeUrl: 合法地址接受', good.code, 200)
@@ -213,6 +218,64 @@ const routeOf = (ctx, path) => ctx.routes.find((entry) => entry.path === path)
   check('无设置面: 保存落内存', saved.body.persisted, false)
 }
 
+// 探活接口：设置页的「测试」按钮靠它，用户不该只能靠发消息才知道配错
+{
+  const ctx = fakeContext()
+  apply(ctx, { mode: 'auto', judgeUrl, startupWaitMs: 0, provision: false })
+  const probe = await call(routeOf(ctx, '/effort-router/probe'), 'POST', {})
+  check('探活: 本地判定可用', probe.body.ok, true)
+  check('探活: 标注后端', probe.body.backend, 'local')
+  check('探活: 带耗时', typeof probe.body.ms, 'number')
+}
+
+{
+  const ctx = fakeContext()
+  ctx.state.judgeUrl = 'http://127.0.0.1:1/judge'
+  apply(ctx, { mode: 'auto', judgeUrl: 'http://127.0.0.1:1/judge', startupWaitMs: 0, provision: false })
+  const probe = await call(routeOf(ctx, '/effort-router/probe'), 'POST', {})
+  check('探活: 连不上时 ok 为假', probe.body.ok, false)
+  check('探活: 失败要说原因', probe.body.detail !== '' && typeof probe.body.detail === 'string', true)
+}
+
+// 回了个不认识的档位：连得上也不算能用
+{
+  const oddUrl = `${judgeUrl.slice(0, judgeUrl.lastIndexOf('/'))}/odd`
+  const ctx = fakeContext()
+  ctx.state.judgeUrl = oddUrl
+  apply(ctx, { mode: 'auto', judgeUrl: oddUrl, startupWaitMs: 0, provision: false })
+  const probe = await call(routeOf(ctx, '/effort-router/probe'), 'POST', {})
+  check('探活: 未知档位不算连通', probe.body.ok, false)
+  check('探活: 说明档位不认识', /档位不认识/.test(probe.body.detail || ''), true)
+}
+
+// 改过的地址必须先保存：否则任何页面都能借这个接口把凭据发到别处
+{
+  const ctx = fakeContext()
+  apply(ctx, { mode: 'auto', judgeUrl, startupWaitMs: 0, provision: false })
+  const guarded = await call(routeOf(ctx, '/effort-router/probe'), 'POST', { judgeUrl: 'http://example.invalid/judge' })
+  check('探活: 改地址未保存时拒绝', guarded.body.ok, false)
+  check('探活: 说明要先保存', /先保存/.test(guarded.body.detail || ''), true)
+}
+
+// 地址守卫按规范化后的 URL 比：换个大小写不是「改过地址」
+{
+  const ctx = fakeContext()
+  apply(ctx, { mode: 'auto', judgeUrl, startupWaitMs: 0, provision: false })
+  const upper = judgeUrl.replace(/^http:\/\//, 'HTTP://')
+  const probe = await call(routeOf(ctx, '/effort-router/probe'), 'POST', { judgeSource: 'local', judgeUrl: upper })
+  check('探活: 地址大小写不算改动', probe.body.ok, true)
+}
+
+// 凭据名填错时的提示要说得清哪里错，不能只回一句「没有可写的字段」
+{
+  const ctx = fakeContext()
+  apply(ctx, { mode: 'auto', judgeUrl, startupWaitMs: 0, provision: false })
+  const bad = await call(routeOf(ctx, '/effort-router/config'), 'POST', { jevApiKeyEnv: 'my key!' })
+  check('凭据名: 拒绝非法字符', bad.body.ok, false)
+  check('凭据名: 校验失败回 400', bad.code, 400)
+  check('凭据名: 提示点名凭据名', /凭据名/.test(bad.body.detail || ''), true)
+}
+
 // 写入被拒：状态码 503，detail 带上宿主给的原因，且确实调过一次 update
 {
   const ctx = fakeContext({ updateThrows: true })
@@ -223,6 +286,7 @@ const routeOf = (ctx, path) => ctx.routes.find((entry) => entry.path === path)
   check('写入被拒: 确实调了 update', ctx.updates.length, 1)
 }
 
+judge.closeAllConnections?.()
 judge.closeAllConnections?.()
 judge.close()
 // 等句柄真的关掉，否则 Node 在 Windows 上退出时会报 libuv 断言。

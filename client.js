@@ -19,11 +19,45 @@ window.__ModuleLoader__.load({
 
     const ENDPOINT = '/effort-router/config'
     const LAST_ENDPOINT = '/effort-router/last'
+    const KEY_ENDPOINT = '/effort-router/key'
+    const OPEN_CREDENTIALS_ENDPOINT = '/effort-router/open-credentials'
 
     /** 判定服务给的档位，以及每个档位能映射到的强度名（宿主侧的粗序）。 */
     const TIER_KEYS = ['low', 'high', 'max', 'fallback']
     const TIER_LABEL = { low: '简单', high: '中等', max: '困难', fallback: '兜底' }
+    /** 凭据来源的显示名。宿主回的是 file / env 这类 token，不直接摆进中文界面。 */
+    const SOURCE_LABEL = { file: '文件', env: '环境变量', 'project-env': '项目 .env', 'user-env': '用户 .env' }
     const EFFORTS = ['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max']
+    /** 档位映射的可选项：去掉 off。它在这套实现里不会真的关思考，只会落到最低档。 */
+    const TIER_OPTIONS = EFFORTS.filter((id) => id !== 'off')
+    const DEFAULT_TIERS = { low: 'low', high: 'high', max: 'max', fallback: 'low' }
+
+    /**
+     * 把宿主返回的配置整理成表单草稿。
+     *
+     * 档位在这里归一化：`off` 之类不在下拉里的历史值会被换回默认，
+     * 否则 select 显示第一项、草稿却还是旧值，保存又把旧值原样送回去。
+     */
+    function draftOf(body) {
+      const source = body !== null && typeof body === 'object' && body.tiers !== null && typeof body.tiers === 'object' ? body.tiers : {}
+      const tiers = { ...DEFAULT_TIERS }
+      for (const key of TIER_KEYS) {
+        const value = source[key]
+        tiers[key] = TIER_OPTIONS.includes(value) ? value : DEFAULT_TIERS[key]
+      }
+      return {
+        enabled: body.enabled !== false,
+        mode: body.mode === 'manual' ? 'manual' : 'auto',
+        judgeSource: body.judgeSource === 'jev' ? 'jev' : 'local',
+        judgeUrl: typeof body.judgeUrl === 'string' ? body.judgeUrl : '',
+        notify: body.notify === 'always' ? 'always' : body.notify === 'off' ? 'off' : '',
+        tiers,
+        jevUrl: typeof body.jevUrl === 'string' ? body.jevUrl : '',
+        jevModel: typeof body.jevModel === 'string' ? body.jevModel : '',
+        jevApiKeyEnv: typeof body.jevApiKeyEnv === 'string' ? body.jevApiKeyEnv : '',
+        jevConfidence: Number.isFinite(Number(body.jevConfidence)) ? String(body.jevConfidence) : '0.6',
+      }
+    }
 
     const S = {
       wrap: { display: 'flex', flexDirection: 'column', gap: 10, padding: '2px 2px 10px' },
@@ -51,7 +85,7 @@ window.__ModuleLoader__.load({
         background: on ? 'color-mix(in srgb, var(--dsw-alias-brand-primary) 14%, transparent)' : 'transparent',
         color: on ? 'var(--dsw-alias-brand-primary)' : 'var(--dsw-alias-label-secondary)',
       }),
-      foot: { display: 'flex', alignItems: 'center', gap: 10 },
+      foot: { display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' },
       tierRow: { display: 'flex', gap: 12, flexWrap: 'wrap' },
       tierCell: { display: 'inline-flex', alignItems: 'center', gap: 5, fontSize: 12 },
       tierLabel: { color: 'var(--dsw-alias-label-secondary)' },
@@ -93,43 +127,163 @@ window.__ModuleLoader__.load({
       },
     }
 
+    /** 固定字段顺序的配置快照：只用来判断「有没有改动」，不依赖对象键序。 */
+    function snapshotOf(value) {
+      if (value === null || value === undefined) return ''
+      return JSON.stringify([
+        value.enabled === true,
+        value.mode,
+        value.judgeSource,
+        value.judgeUrl,
+        value.notify,
+        TIER_KEYS.map((key) => (value.tiers && value.tiers[key] !== undefined ? value.tiers[key] : '')),
+        value.jevUrl,
+        value.jevModel,
+        value.jevApiKeyEnv,
+        String(value.jevConfidence),
+      ])
+    }
+
     function ConfigPanel() {
       const [cfg, setCfg] = React.useState(null)
       const [draft, setDraft] = React.useState(null)
       const [note, setNote] = React.useState('')
+      const [loadError, setLoadError] = React.useState('')
       const [busy, setBusy] = React.useState(false)
+      const [probing, setProbing] = React.useState(false)
+      const [saved, setSaved] = React.useState('')
+      const [keyDraft, setKeyDraft] = React.useState('')
+      const [keyStatus, setKeyStatus] = React.useState(null)
+      const [keyOpening, setKeyOpening] = React.useState(false)
+      const noteTimer = React.useRef(null)
+
+      /** 统一的提示出口：写入前清掉上一条的定时器，3 秒后自动消失。 */
+      const showNote = React.useCallback((text) => {
+        if (noteTimer.current !== null) clearTimeout(noteTimer.current)
+        noteTimer.current = null
+        setNote(text)
+        if (text) {
+          noteTimer.current = setTimeout(() => {
+            noteTimer.current = null
+            setNote('')
+          }, 3000)
+        }
+      }, [])
+
+      // 卸载时清掉挂起的定时器，别在已卸载的组件上 setState。
+      React.useEffect(() => () => {
+        if (noteTimer.current !== null) clearTimeout(noteTimer.current)
+      }, [])
 
       const load = React.useCallback(async () => {
         try {
           const res = await fetch(ENDPOINT)
           const body = await res.json()
           setCfg(body)
-          setDraft({
-            enabled: body.enabled !== false,
-            mode: body.mode === 'manual' ? 'manual' : 'auto',
-            judgeSource: body.judgeSource === 'jev' ? 'jev' : 'local',
-            judgeUrl: typeof body.judgeUrl === 'string' ? body.judgeUrl : '',
-            notify: body.notify === 'always' ? 'always' : 'off',
-            tiers: { low: 'low', high: 'high', max: 'max', fallback: 'low', ...(body.tiers || {}) },
-            jevUrl: typeof body.jevUrl === 'string' ? body.jevUrl : '',
-            jevModel: typeof body.jevModel === 'string' ? body.jevModel : '',
-            jevApiKeyEnv: typeof body.jevApiKeyEnv === 'string' ? body.jevApiKeyEnv : '',
-            jevConfidence: Number.isFinite(Number(body.jevConfidence)) ? Number(body.jevConfidence) : 0.6,
-          })
+          const next = draftOf(body)
+          setDraft(next)
+          // 初次载入就对齐快照，否则一进页面「保存」就是可点的。
+          setSaved(snapshotOf(next))
         } catch (error) {
-          setNote('读取失败：' + (error && error.message ? error.message : error))
+          const message = '读取失败：' + (error && error.message ? error.message : error)
+          // 只写 note 会被「读取中…」挡住看不到，另存一份错误状态让页面渲染出来。
+          setLoadError(message)
+          showNote(message)
         }
-      }, [])
+      }, [showNote])
 
       React.useEffect(() => { void load() }, [load])
 
+      /** Key 只写不读：状态只用来显示和算 placeholder，任何已有 Key 都不回显。 */
+      const loadKey = React.useCallback(async () => {
+        try {
+          const res = await fetch(KEY_ENDPOINT)
+          const body = await res.json()
+          setKeyStatus(body !== null && typeof body === 'object' ? body : { configured: false, source: null })
+        } catch {
+          // 取不到就当未配置，别让配置页崩掉。
+          setKeyStatus({ configured: false, source: null })
+        }
+      }, [])
+      React.useEffect(() => { void loadKey() }, [loadKey])
+
+      const openKeyFile = async () => {
+        setKeyOpening(true)
+        try {
+          const res = await fetch(OPEN_CREDENTIALS_ENDPOINT, { method: 'POST' })
+          // 非 JSON 响应也不能把提示变成解析错误：解析失败就退回状态码。
+          const body = await res.json().catch(() => undefined)
+          if (res.ok === true && body !== undefined && body.ok === true) {
+            showNote('已打开 ' + body.path)
+          } else {
+            showNote('打开失败：' + (body && body.detail ? body.detail : 'HTTP ' + res.status))
+          }
+        } catch (error) {
+          showNote('打开失败：' + (error && error.message ? error.message : error))
+        } finally {
+          setKeyOpening(false)
+        }
+      }
+
+      if (draft === null && loadError !== '') return h('div', { style: S.row },
+        h('span', { style: S.note }, loadError),
+        h('button', {
+          style: S.save,
+          onClick: () => { setLoadError(''); void load() },
+        }, '重试'),
+      )
       if (draft === null) return h('div', { style: S.note }, '读取中…')
 
       const writable = cfg !== null && cfg.writable === true
+      // 当前草稿与最近一次成功保存（或初次载入）的快照不同，才算有改动。
+      const changed = snapshotOf(draft) !== saved
+      // 只填 Key 不动其它字段时也要能保存，否则 Key 提交不出去；初始载入两者皆空仍是灰的。
+      const canSave = changed || keyDraft.trim() !== ''
 
       const save = async () => {
+        // Key 走独立接口，先于配置保存：失败就停在这里，配置一动不动。
+        let keySaved = false
+        // 后面任何一步失败，都要说清 Key 已经写进去了，不然用户会以为整单没存。
+        const suffix = () => (keySaved ? '（Key 已保存）' : '')
+        const keyText = keyDraft.trim()
+        if (keyText !== '') {
+          setBusy(true)
+          try {
+            const res = await fetch(KEY_ENDPOINT, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ key: keyText }),
+            })
+            const body = await res.json()
+            if (body === null || typeof body !== 'object' || body.ok !== true) {
+              showNote((body && body.detail) || 'Key 保存失败')
+              return
+            }
+            keySaved = true
+            setKeyDraft('')
+            void loadKey()
+          } catch (error) {
+            showNote('Key 保存失败：' + (error && error.message ? error.message : error))
+            return
+          } finally {
+            setBusy(false)
+          }
+        }
+        // 宿主 writeConfig 会忽略空字段：空值发过去就被旧配置静默还原，先在前端拦下。
+        if (draft.judgeUrl.trim() === '') return showNote('判定地址不能为空' + suffix())
+        // 走本地判定时 Jev 那几项是隐藏的，既不校验也不提交，免得报一个看不见的错。
+        const jev = draft.judgeSource === 'jev'
+        if (jev) {
+          if (draft.jevUrl.trim() === '') return showNote('Jev 地址不能为空' + suffix())
+          if (draft.jevModel.trim() === '') return showNote('Jev 模型名不能为空' + suffix())
+          // 草稿里存的是原始字符串：空串 Number 出 0，会被当成合法阈值「永远听 Jev 自己的档」。
+          const confidence = Number(draft.jevConfidence)
+          if (draft.jevConfidence.trim() === '' || Number.isNaN(confidence) || confidence < 0 || confidence > 1) {
+            return showNote('置信度阈值必须在 0 到 1 之间' + suffix())
+          }
+        }
         setBusy(true)
-        setNote('')
+        showNote('')
         try {
           const res = await fetch(ENDPOINT, {
             method: 'POST',
@@ -141,36 +295,74 @@ window.__ModuleLoader__.load({
               judgeUrl: draft.judgeUrl,
               notify: draft.notify,
               tiers: draft.tiers,
-              jevUrl: draft.jevUrl,
-              jevModel: draft.jevModel,
-              jevApiKeyEnv: draft.jevApiKeyEnv,
-              jevConfidence: draft.jevConfidence,
+              ...(jev ? {
+                jevUrl: draft.jevUrl,
+                jevModel: draft.jevModel,
+                jevConfidence: Number(draft.jevConfidence),
+              } : {}),
             }),
           })
           const body = await res.json()
           if (body.ok === true) {
-            setNote(body.persisted === true ? '已保存' : '已保存到内存（设置服务不可用）')
+            showNote(body.persisted === true ? '已保存' : '已保存到内存（设置服务不可用）')
             if (body.config) {
               setCfg(body.config)
-              setDraft((previous) => ({ ...previous, mode: body.config.mode === 'manual' ? 'manual' : 'auto' }))
+              // 用宿主回写的配置重建草稿：它会归一化 URL、档位等字段，
+              // 只回填 mode 会让「保存」一直停在可点态。
+              const next = draftOf(body.config)
+              setDraft(next)
+              setSaved(snapshotOf(next))
+            } else {
+              setSaved(snapshotOf(draft))
             }
           } else {
-            setNote(body.detail || '保存失败')
+            showNote((body.detail || '保存失败') + suffix())
           }
         } catch (error) {
-          setNote('保存失败：' + (error && error.message ? error.message : error))
+          showNote('保存失败：' + (error && error.message ? error.message : error) + suffix())
         } finally {
           setBusy(false)
+        }
+      }
+
+      const probe = async () => {
+        setProbing(true)
+        showNote('')
+        try {
+          const res = await fetch('/effort-router/probe', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            // 带上草稿：测试的应该是「即将保存的这套」，不是上一次保存的那套。
+            body: JSON.stringify({
+              judgeSource: draft.judgeSource,
+              jevModel: draft.jevModel,
+              judgeUrl: draft.judgeUrl,
+              jevUrl: draft.jevUrl,
+            }),
+          })
+          const body = await res.json()
+          // 状态码也要看：非 200 就算响应体里写着 ok 也不算连通。
+          if (res.ok === true && body && body.ok === true) {
+            showNote(`连通：${body.backend} · ${body.detail}（${body.ms}ms）`)
+          } else {
+            const detail = body && body.detail !== undefined && body.detail !== null ? body.detail : `HTTP ${res.status}`
+            showNote('不通：' + detail)
+          }
+        } catch (error) {
+          showNote('测试失败：' + (error && error.message ? error.message : error))
+        } finally {
+          setProbing(false)
         }
       }
 
       return h('div', { style: S.wrap },
         h('div', { style: S.row },
           h('span', { style: S.label }, '路由开关'),
-          h('div', { style: S.seg },
+          h('div', { style: S.seg, role: 'group' },
             [[true, '开启'], [false, '关闭']].map(([value, text]) => h('button', {
               key: String(value),
               style: S.chip(draft.enabled === value),
+              'aria-pressed': draft.enabled === value,
               onClick: () => setDraft((previous) => ({ ...previous, enabled: value })),
             }, text)),
           ),
@@ -178,10 +370,11 @@ window.__ModuleLoader__.load({
         ),
         h('div', { style: S.row },
           h('span', { style: S.label }, '判定方式'),
-          h('div', { style: S.seg },
+          h('div', { style: S.seg, role: 'group' },
             [['local', '本地服务'], ['jev', 'Jev']].map(([id, text]) => h('button', {
               key: id,
               style: S.chip(draft.judgeSource === id),
+              'aria-pressed': draft.judgeSource === id,
               onClick: () => setDraft((previous) => ({ ...previous, judgeSource: id })),
             }, text)),
           ),
@@ -206,13 +399,29 @@ window.__ModuleLoader__.load({
             }),
           ),
           h('div', { style: S.row },
-            h('span', { style: S.label }, '凭据名'),
+            h('span', { style: S.label }, 'API Key'),
             h('input', {
               style: S.input,
-              value: draft.jevApiKeyEnv,
-              placeholder: 'TOKENFLUX_API_KEY',
-              onChange: (event) => setDraft((previous) => ({ ...previous, jevApiKeyEnv: event.target.value })),
+              type: 'password',
+              autoComplete: 'new-password',
+              value: keyDraft,
+              placeholder: keyStatus !== null && keyStatus.configured === true ? '已配置，留空则不修改' : '填入 TokenFlux Jev Key',
+              onChange: (event) => setKeyDraft(event.target.value),
             }),
+            h('button', {
+              style: S.save,
+              disabled: keyOpening,
+              onClick: () => void openKeyFile(),
+            }, keyOpening ? '打开中…' : '打开凭据文件'),
+            h('span', { style: S.note },
+              keyStatus === null
+                ? '读取中…'
+                : keyStatus.configured === true
+                  ? '已配置' + (keyStatus.source ? '（来源：' + (SOURCE_LABEL[keyStatus.source] ?? keyStatus.source) + '）' : '')
+                  : '未配置',
+              // 引用名是低敏信息，摆出来才能对上「运行时到底在读哪一条」。
+              keyStatus !== null && typeof keyStatus.ref === 'string' ? ' · ' + keyStatus.ref : '',
+            ),
           ),
           h('div', { style: S.row },
             h('span', { style: S.label }, '置信度阈值'),
@@ -222,18 +431,19 @@ window.__ModuleLoader__.load({
               min: 0,
               max: 1,
               step: 0.05,
-              value: String(draft.jevConfidence),
-              onChange: (event) => setDraft((previous) => ({ ...previous, jevConfidence: Number(event.target.value) })),
+              value: draft.jevConfidence,
+              onChange: (event) => setDraft((previous) => ({ ...previous, jevConfidence: event.target.value })),
             }),
             h('span', { style: S.note }, '低于它就在最高的两档里取更强的那档'),
           ),
         ) : null,
         h('div', { style: S.row },
           h('span', { style: S.label }, '模式'),
-          h('div', { style: S.seg },
+          h('div', { style: S.seg, role: 'group' },
             [['auto', '自动'], ['manual', '手动']].map(([id, text]) => h('button', {
               key: id,
               style: S.chip(draft.mode === id),
+              'aria-pressed': draft.mode === id,
               onClick: () => setDraft((previous) => ({ ...previous, mode: id })),
             }, text)),
           ),
@@ -249,10 +459,11 @@ window.__ModuleLoader__.load({
         ),
         h('div', { style: S.row },
           h('span', { style: S.label }, '对话提示'),
-          h('div', { style: S.seg },
-            [['off', '不提示'], ['always', '每轮都提示']].map(([id, text]) => h('button', {
+          h('div', { style: S.seg, role: 'group' },
+            [['', '变化时提示'], ['always', '每轮都提示'], ['off', '不提示']].map(([id, text]) => h('button', {
               key: id,
               style: S.chip(draft.notify === id),
+              'aria-pressed': draft.notify === id,
               onClick: () => setDraft((previous) => ({ ...previous, notify: id })),
             }, text)),
           ),
@@ -269,20 +480,29 @@ window.__ModuleLoader__.load({
                   const value = event.target.value
                   setDraft((previous) => ({ ...previous, tiers: { ...previous.tiers, [key]: value } }))
                 },
-              }, EFFORTS.map((id) => h('option', { key: id, value: id }, id))),
+              }, TIER_OPTIONS.map((id) => h('option', { key: id, value: id }, id))),
             )),
           ),
         ),
         h('div', { style: S.row },
           h('span', { style: S.label }, ''),
-          h('span', { style: S.note }, '留默认值时按模型自己的档位自动分布（最低 / 中间 / 最高）；改成非默认值才按这张表走'),
+          h('span', { style: S.note }, '留默认值时按模型自己的档位自动分布（最低 / 中间 / 最高）；改成非默认值才按这张表走。选了模型不支持的档，会退到最接近的较低档'),
+        ),
+        h('div', { style: S.row },
+          h('span', { style: S.label }, ''),
+          h('span', { style: S.note }, '插件会改写模型选择器里的「推理等级」，那里显示的就是本轮实际使用的档位。'),
         ),
         h('div', { style: S.foot },
           h('button', {
-            style: S.save,
-            disabled: busy || !writable,
+            style: canSave ? S.save : { ...S.save, opacity: 0.5 },
+            disabled: busy || !writable || !canSave,
             onClick: () => void save(),
           }, busy ? '保存中…' : '保存'),
+          h('button', {
+            style: S.save,
+            disabled: probing,
+            onClick: () => void probe(),
+          }, probing ? '测试中…' : '测试'),
           h('span', { style: S.note }, note),
         ),
       )

@@ -54,6 +54,13 @@ ctx.provide('llm', {
     return { reasoning: { efforts: [{ id: 'low' }, { id: 'high' }, { id: 'max' }] } }
   },
 })
+// 会话选择的写入接口：pre-step 把强度写进这里，请求才真的带上它。
+const selections = []
+ctx.provide('sessionController', {
+  selectForNextRequest(agent, selection) {
+    selections.push({ session: agent?.session?.id, ...selection })
+  },
+})
 ctx.provide('sessionProjections', {
   stateOf: () => ({
     lastUsed: { provider: 'cmdc-proxy', model: 'deepseek-v4.1-flash', reasoningEffort: 'max' },
@@ -82,12 +89,17 @@ const decision = await ctx.waterfall('agent/pre-step', { agent, step: 1 },
 check('真 cordis: 插了一条提示', decision.messages.length, 1)
 check('真 cordis: 提示用本轮模型', decision.messages[0].content[0].text,
   '[effort-router] 难度 max → 强度 max（minimax-m-plan/MiniMax-M3.1-Flash）')
+// 真正让请求带上强度的是 pre-step 写进会话选择的那份，这条必须有覆盖。
+check('真 cordis: 写了一次会话选择', selections.length, 1)
+check('真 cordis: 选择写到本会话', selections[0]?.session, 'session-cordis')
+check('真 cordis: 选择带本轮模型', `${selections[0]?.provider}/${selections[0]?.model}`, 'minimax-m-plan/MiniMax-M3.1-Flash')
+check('真 cordis: 选择带判定强度', selections[0]?.reasoningEffort, 'max')
 
-// 十二条 HTTP 路由：新路径六条（judge / mode / config / models / last / seen），旧路径别名六条
-check('真 cordis: 路由条数', routes.length, 12)
+// 十八条 HTTP 路由：新路径九条（judge / mode / config / models / last / seen / probe / key / open-credentials），旧路径别名九条
+check('真 cordis: 路由条数', routes.length, 18)
 const paths = routes.map((route) => route.path)
-check('真 cordis: 新路径都在', paths.filter((path) => path.startsWith('/effort-router/')).length, 6)
-check('真 cordis: 旧别名都在', paths.filter((path) => path.startsWith('/router-effort/')).length, 6)
+check('真 cordis: 新路径都在', paths.filter((path) => path.startsWith('/effort-router/')).length, 9)
+check('真 cordis: 旧别名都在', paths.filter((path) => path.startsWith('/router-effort/')).length, 9)
 const judgeRoute = routes.find((route) => route.path === '/effort-router/judge')
 let body = ''
 judgeRoute.handler({ method: 'GET' }, {

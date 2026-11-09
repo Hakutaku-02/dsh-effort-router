@@ -41,7 +41,7 @@ const jev = createServer((req, res) => {
 await new Promise((resolve) => jev.listen(0, '127.0.0.1', resolve))
 const jevUrl = `http://127.0.0.1:${jev.address().port}/v1/systemone`
 
-function fakeContext() {
+function fakeContext(credentialValues) {
   const handlers = new Map()
   const routes = []
   const state = { mode: 'auto', judgeSource: 'jev', notify: '', tiers: {}, jevUrl, jevApiKeyEnv: KEY_NAME }
@@ -51,6 +51,16 @@ function fakeContext() {
     state,
     on(event, handler) { handlers.set(event, handler) },
     get(name) {
+      // 宿主凭据服务的真实形状是 { value, source }，这里照这个给。
+      if (name === 'credentials' && credentialValues !== undefined) {
+        return {
+          async resolve(ref) {
+            return Object.prototype.hasOwnProperty.call(credentialValues, ref)
+              ? { value: credentialValues[ref], source: 'test' }
+              : undefined
+          },
+        }
+      }
       if (name === 'settings') {
         return {
           describe() { return [{ ns: 'effort-router', value: { ...state } }] },
@@ -76,6 +86,29 @@ function fakeContext() {
 
 const agentOf = (id) => ({ session: { id, requestHeader: () => ({ config: { provider: 'p', model: 'm' } }) } })
 
+/** 调一条已注册的 POST 路由，返回 {code, body}。 */
+function callRoute(ctx, path, body) {
+  const route = ctx.routes.find((entry) => entry.path === path)
+  return new Promise((resolve) => {
+    const listeners = {}
+    const req = {
+      method: 'POST',
+      url: path,
+      headers: { 'content-type': 'application/json' },
+      on(event, fn) { listeners[event] = fn },
+      destroy() {},
+    }
+    const res = {
+      statusCode: 0,
+      setHeader() {},
+      end(text) { resolve({ code: res.statusCode, body: text === undefined || text === '' ? undefined : JSON.parse(text) }) },
+    }
+    route.handler(req, res)
+    listeners.data?.(JSON.stringify(body))
+    listeners.end?.()
+  })
+}
+
 async function turnOf(ctx, id, turn) {
   const agent = agentOf(id)
   ctx.handlers.get('agent/inbox/claimed')({ agent, message: { content: [{ type: 'text', text: '重构这个模块并补测试' }] } })
@@ -83,8 +116,8 @@ async function turnOf(ctx, id, turn) {
     async () => ({ provider: 'p', model: 'm', reasoningEffort: 'low' }))
 }
 
-function fresh(state = {}) {
-  const ctx = fakeContext()
+function fresh(state = {}, credentialValues) {
+  const ctx = fakeContext(credentialValues)
   Object.assign(ctx.state, state)
   apply(ctx, { mode: 'auto', startupWaitMs: 0, provision: false })
   return ctx
@@ -157,6 +190,48 @@ function fresh(state = {}) {
   check('Jev: 没 key 不改强度', config.reasoningEffort, 'low')
   check('Jev: 没 key 不发请求', seenBody, undefined)
   process.env[KEY_NAME] = 'test-key-value'
+}
+
+// 凭据只在宿主凭据服务里：resolve 返回 {value, source}，不是裸字符串
+{
+  delete process.env[KEY_NAME]
+  const CRED_NAME = 'CRED_JEV_KEY'
+  scenario = { status: 200, body: { answers: { effort: { choice: 'max', confidence: 0.9 } } } }
+  const ctx = fresh({ jevApiKeyEnv: CRED_NAME }, { [CRED_NAME]: 'cred-value' })
+  const config = await turnOf(ctx, 'session-jev-credential', 1)
+  check('Jev: 凭据服务返回对象也能用', config.reasoningEffort, 'max')
+  check('Jev: 用的是凭据服务里的值', seenAuth, 'Bearer cred-value')
+  process.env[KEY_NAME] = 'test-key-value'
+}
+
+// 探活不接受调用方指定凭据名：否则任何本地进程都能借它把别的 key 发出去
+{
+  const ctx = fresh()
+  process.env.PROBE_KEY = 'probe-value'
+  seenAuth = undefined
+  const probe = await callRoute(ctx, '/effort-router/probe', { judgeSource: 'jev', jevApiKeyEnv: 'PROBE_KEY' })
+  check('探活: 仍能连通', probe.body.ok, true)
+  check('探活: 用的是已保存的凭据', seenAuth, 'Bearer test-key-value')
+  delete process.env.PROBE_KEY
+}
+
+// 凭据库优先于环境变量：面板写进凭据库的值必须真正生效
+{
+  scenario = { status: 200, body: { answers: { effort: { choice: 'max', confidence: 0.9 } } } }
+  const ctx = fresh({}, { [KEY_NAME]: 'from-store' })
+  const config = await turnOf(ctx, 'session-jev-precedence', 1)
+  check('Jev: 凭据库优先', seenAuth, 'Bearer from-store')
+  check('Jev: 凭据库优先时判定照常', config.reasoningEffort, 'max')
+}
+
+// 测 jev 时，本地判定地址改没改与本次无关
+{
+  const ctx = fresh()
+  const probe = await callRoute(ctx, '/effort-router/probe', {
+    judgeSource: 'jev',
+    judgeUrl: 'http://example.invalid/judge',
+  })
+  check('探活: 只比当前后端的地址', probe.body.ok, true)
 }
 
 // 地址不可达
