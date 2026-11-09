@@ -15,7 +15,9 @@ import { apply } from '../index.js'
 process.env.ROUTER_EFFORT_LOG = `${tmpdir()}/router-effort-test.log`
 process.env.ROUTER_EFFORT_HOME = mkdtempSync(join(tmpdir(), 'effort-router-home-'))
 
-const root = process.env.DSH_ROOT ?? 'C:/Users/Hakutaku02/AppData/Local/Programs/DeepSeek Harness/resources/app/dsh'
+// 默认按 Windows 的安装位置拼，不写死用户目录：换台机器/换个账户都能对上，对不上就跳过。
+const root = process.env.DSH_ROOT
+  ?? join(process.env.LOCALAPPDATA ?? '', 'Programs/DeepSeek Harness/resources/app/dsh')
 const cordisEntry = join(root, 'node_modules/@deepseek-ai/cordis/lib/index.js')
 if (!existsSync(cordisEntry)) {
   console.log(`跳过：找不到 cordis（${cordisEntry}）。用 DSH_ROOT 指向 DSH 安装目录后重跑。`)

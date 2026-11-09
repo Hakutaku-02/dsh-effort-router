@@ -15,5 +15,6 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: ${{ matrix.node }}
-      # 这个包没有运行时依赖，不需要 install。
+      # 不跑 install：测试都不 import 运行时依赖 dsh-router-laya，
+      # 镜像与部署用的是临时目录里造的假包。
       - run: npm test

@@ -1,9 +1,8 @@
 node_modules/
 *.log
 
-# 本地参考用的会话导出，不进仓库
+# 开发时导出的 DSH 会话记录，与插件无关，但里面是真实对话，别让它进来
 sessions/
-recovered/
 
 .DS_Store
 Thumbs.db

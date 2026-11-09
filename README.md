@@ -115,16 +115,16 @@ mklink /J "%USERPROFILE%\.dsh\profiles\desktop\node_modules\dsh-effort-router" "
 Desktop 用户走 GUI：设置里的插件管理，安装框填 spec。这几种写法都行：
 
 ```
-dsh-effort-router                                      # npm 注册表
-github:OWNER/dsh-effort-router                         # GitHub 仓库
-https://codeload.github.com/OWNER/dsh-effort-router/tar.gz/refs/tags/v0.1.0
-D:\path\to\dsh-effort-router                            # 本地目录，绝对路径
+github:Hakutaku-02/dsh-effort-router          # GitHub 仓库，默认分支
+github:Hakutaku-02/dsh-effort-router#Jev      # 指定分支
+dsh-effort-router                             # npm 注册表，尚未发布，现在填它装不上
+D:\path\to\dsh-effort-router                  # 本地目录，绝对路径
 ```
 
 命令行用户（web、tui、headless 这些 profile）：
 
 ```bash
-dsh plugin --profile web install dsh-effort-router
+dsh plugin --profile web install github:Hakutaku-02/dsh-effort-router
 ```
 
 `install` 与 `add` 等价，剩下的参数原样交给 pnpm。`--profile` 是必填项。`desktop` 这个 profile 由 Electron 应用独占，CLI 会直接拒绝，Desktop 用户只能用 GUI。
