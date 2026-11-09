@@ -1,0 +1,42 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="320" viewBox="0 0 1280 320" role="img" aria-label="dsh-effort-router banner">
+  <defs>
+    <pattern id="grid" width="40" height="40" patternUnits="userSpaceOnUse">
+      <path d="M40 0H0V40" fill="none" stroke="#E6EDF3" stroke-width="1" opacity="0.06"/>
+    </pattern>
+    <radialGradient id="glow" cx="50%" cy="50%" r="50%">
+      <stop offset="0" stop-color="#22D3EE" stop-opacity="0.26"/>
+      <stop offset="0.45" stop-color="#3B82F6" stop-opacity="0.13"/>
+      <stop offset="1" stop-color="#8B5CF6" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="glowLow" cx="50%" cy="50%" r="50%">
+      <stop offset="0" stop-color="#3B82F6" stop-opacity="0.12"/>
+      <stop offset="1" stop-color="#3B82F6" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="topline" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#22D3EE" stop-opacity="0"/>
+      <stop offset="0.35" stop-color="#22D3EE" stop-opacity="0.5"/>
+      <stop offset="0.7" stop-color="#8B5CF6" stop-opacity="0.5"/>
+      <stop offset="1" stop-color="#8B5CF6" stop-opacity="0"/>
+    </linearGradient>
+  </defs>
+
+  <rect width="1280" height="320" fill="#0B0F14"/>
+  <rect width="1280" height="320" fill="url(#grid)"/>
+  <ellipse cx="1160" cy="150" rx="580" ry="300" fill="url(#glow)"/>
+  <ellipse cx="1180" cy="320" rx="460" ry="150" fill="url(#glowLow)"/>
+  <rect x="0" y="0" width="1280" height="2" fill="url(#topline)"/>
+
+  <text x="72" y="118" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="14" letter-spacing="3" fill="#22D3EE" opacity="0.8">EFFORT ROUTER &#183; DEEPSEEK HARNESS PLUGIN</text>
+  <text x="72" y="182" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="64" font-weight="600" fill="#E6EDF3">dsh-effort-router</text>
+  <text x="72" y="230" font-family='system-ui, "PingFang SC", "Microsoft YaHei", sans-serif' font-size="28" fill="#98A6B5">&#25353;&#38590;&#24230;&#33258;&#21160;&#35843;&#24605;&#32771;&#24378;&#24230;</text>
+
+  <rect x="1108" y="200" width="14" height="64" rx="7" fill="#22D3EE" opacity="0.5"/>
+  <rect x="1146" y="152" width="14" height="112" rx="7" fill="#3B82F6" opacity="0.75"/>
+  <rect x="1184" y="88" width="14" height="176" rx="7" fill="#8B5CF6"/>
+  <rect x="1108" y="270" width="90" height="1" fill="#8B98A5" opacity="0.28"/>
+  <g font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="9" letter-spacing="1" fill="#5B6B7C" text-anchor="middle">
+    <text x="1115" y="292">low</text>
+    <text x="1153" y="292">high</text>
+    <text x="1191" y="292">max</text>
+  </g>
+</svg>

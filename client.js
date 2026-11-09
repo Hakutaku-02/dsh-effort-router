@@ -385,7 +385,7 @@ window.__ModuleLoader__.load({
             h('input', {
               style: S.input,
               value: draft.jevUrl,
-              placeholder: 'https://tokenflux.dev/v1/systemone',
+              placeholder: 'https://api.typesafe.ai/v1/systemone',
               onChange: (event) => setDraft((previous) => ({ ...previous, jevUrl: event.target.value })),
             }),
           ),
@@ -405,7 +405,7 @@ window.__ModuleLoader__.load({
               type: 'password',
               autoComplete: 'new-password',
               value: keyDraft,
-              placeholder: keyStatus !== null && keyStatus.configured === true ? '已配置，留空则不修改' : '填入 TokenFlux Jev Key',
+              placeholder: keyStatus !== null && keyStatus.configured === true ? '已配置，留空则不修改' : '填入 TypeSafe Jev Key',
               onChange: (event) => setKeyDraft(event.target.value),
             }),
             h('button', {

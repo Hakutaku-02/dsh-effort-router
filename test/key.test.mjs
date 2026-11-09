@@ -110,7 +110,7 @@ const mount = (ctx) => apply(ctx, { mode: 'auto', startupWaitMs: 0, provision: f
 
   const saved = await call(route, 'POST', { key: '  sk-test-value  ' })
   check('Key: 写入状态码', saved.code, 200)
-  check('Key: 写入已裁剪', ctx.writes[0], { ref: 'TEST_KEY_REF', value: 'sk-test-value' })
+  check('Key: 写入已裁剪', ctx.writes[0], { ref: 'TYPESAFE_API_KEY', value: 'sk-test-value' })
   check('Key: 写入后已配置', saved.body.configured, true)
   check('Key: 写入后回源', saved.body.source, 'file')
 
@@ -161,25 +161,24 @@ const mount = (ctx) => apply(ctx, { mode: 'auto', startupWaitMs: 0, provision: f
   check('同源: 本页写入放行', same.code, 200)
 }
 
-// 配置里的引用名不合法：拒绝写入，别把凭据文件写坏
+// 配置指着别的引用名时：Key 写到默认引用，配置跟着改，判定才不会读空
 {
   const ctx = fakeContext()
-  ctx.state.jevApiKeyEnv = 'bad-name'
-  mount(ctx)
-  const bad = await call(routeOf(ctx, '/effort-router/key'), 'POST', { key: 'sk-jev' })
-  check('Key: 非法引用名被拒', bad.code, 400)
-  check('Key: 非法引用名不写', ctx.writes.length, 0)
-}
-
-// 旧配置指向共用 key 时：写 Jev 专用名并改配置，别顶掉 provider 的 key
-{
-  const ctx = fakeContext()
-  ctx.state.jevApiKeyEnv = 'TOKENFLUX_API_KEY'
+  ctx.state.jevApiKeyEnv = 'SOME_OTHER_REF'
   mount(ctx)
   const saved = await call(routeOf(ctx, '/effort-router/key'), 'POST', { key: 'sk-jev' })
-  check('Key: 写入专用引用', ctx.writes[0], { ref: 'TOKENFLUX_JEV_KEY', value: 'sk-jev' })
-  check('Key: 配置改成专用引用', ctx.state.jevApiKeyEnv, 'TOKENFLUX_JEV_KEY')
+  check('Key: 写入 TypeSafe 引用', ctx.writes[0], { ref: 'TYPESAFE_API_KEY', value: 'sk-jev' })
+  check('Key: 配置跟着改', ctx.state.jevApiKeyEnv, 'TYPESAFE_API_KEY')
   check('Key: 回读已配置', saved.body.configured, true)
+}
+
+// 没配过引用名时，默认落在 TypeSafe 的引用上
+{
+  const ctx = fakeContext()
+  delete ctx.state.jevApiKeyEnv
+  mount(ctx)
+  const status = await call(routeOf(ctx, '/effort-router/key'), 'GET')
+  check('Key: 默认引用名', status.body.ref, 'TYPESAFE_API_KEY')
 }
 
 // 打开凭据文件：路径固定，文件不存在回 404，方法不对回 405

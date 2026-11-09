@@ -120,6 +120,7 @@ const routeOf = (ctx, path) => ctx.routes.find((entry) => entry.path === path)
   check('配置: entryId', got.body.entryId, 'effort-router')
   check('配置: 可写', got.body.writable, true)
   check('配置: 初值 mode', got.body.mode, 'auto')
+  check('配置: Jev 默认网关', got.body.jevUrl, 'https://api.typesafe.ai/v1/systemone')
 
   const saved = await call(routeOf(ctx, '/effort-router/config'), 'POST', { mode: 'manual', notify: 'always' })
   check('配置: POST 状态码', saved.code, 200)

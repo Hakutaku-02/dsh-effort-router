@@ -31,7 +31,7 @@ const SETUP_LOG_PATH = `${tmpdir()}/router-effort-setup.log`
 /** 挂载痕迹。宿主没有稳定的 stderr 落盘，这里记一行，重启后能确认插件到底有没有挂上。 */
 const MOUNT_LOG_PATH = `${tmpdir()}/router-effort.log`
 
-/** 判定后端。local 走本机服务；jev 走 TokenFlux 中转的 System One 决策端点。 */
+/** 判定后端。local 走本机服务；jev 走 TypeSafe 的 System One 决策端点。 */
 const JUDGE_SOURCES = ['local', 'jev']
 const MODES = ['auto', 'manual']
 
@@ -49,10 +49,10 @@ const MAX_QUERY_LENGTH = 200
 /** 模型档位缓存的容量上限，防止外部传入的端点名把这张表撑大。 */
 const MAX_MODEL_CACHE = 200
 
-/** Jev 的默认值：tokenflux 的 System One 决策端点。它不接受 chat/completions。 */
-const DEFAULT_JEV_URL = 'https://tokenflux.dev/v1/systemone'
+/** Jev 的默认值：TypeSafe 官方的 System One 决策端点。它不接受 chat/completions。 */
+const DEFAULT_JEV_URL = 'https://api.typesafe.ai/v1/systemone'
 const DEFAULT_JEV_MODEL = 'jev-latest'
-const DEFAULT_JEV_API_KEY_ENV = 'TOKENFLUX_API_KEY'
+const JEV_KEY_REF = 'TYPESAFE_API_KEY'
 const DEFAULT_JEV_CONFIDENCE = 0.6
 const JEV_TIMEOUT_MS = 12000
 
@@ -83,7 +83,7 @@ export const Config = z.object({
   // Jev 走决策协议，不是 chat：地址、模型名、凭据引用都要单独配。
   jevUrl: z.string().default(DEFAULT_JEV_URL).volatile(),
   jevModel: z.string().default(DEFAULT_JEV_MODEL).volatile(),
-  jevApiKeyEnv: z.string().default(DEFAULT_JEV_API_KEY_ENV).volatile(),
+  jevApiKeyEnv: z.string().default(JEV_KEY_REF).volatile(),
   jevConfidence: z.number().default(DEFAULT_JEV_CONFIDENCE).volatile(),
   jevTimeoutMs: z.number().default(JEV_TIMEOUT_MS),
   notify: z.string().default('').volatile(),
@@ -615,7 +615,7 @@ export function apply(ctx, config) {
       tiers: { ...DEFAULT_TIERS, ...tierSource },
       jevUrl: typeof values?.jevUrl === 'string' && values.jevUrl !== '' ? values.jevUrl : (valueOf(cfg.jevUrl, '') || DEFAULT_JEV_URL),
       jevModel: typeof values?.jevModel === 'string' && values.jevModel !== '' ? values.jevModel : (valueOf(cfg.jevModel, '') || DEFAULT_JEV_MODEL),
-      jevApiKeyEnv: typeof values?.jevApiKeyEnv === 'string' && values.jevApiKeyEnv !== '' ? values.jevApiKeyEnv : (valueOf(cfg.jevApiKeyEnv, '') || DEFAULT_JEV_API_KEY_ENV),
+      jevApiKeyEnv: typeof values?.jevApiKeyEnv === 'string' && values.jevApiKeyEnv !== '' ? values.jevApiKeyEnv : (valueOf(cfg.jevApiKeyEnv, '') || JEV_KEY_REF),
       jevConfidence: Number.isFinite(Number(values?.jevConfidence)) ? Number(values.jevConfidence) : toMs(cfg.jevConfidence, DEFAULT_JEV_CONFIDENCE),
       jevTimeoutMs: toMs(values?.jevTimeoutMs ?? cfg.jevTimeoutMs, JEV_TIMEOUT_MS),
     }
@@ -700,7 +700,7 @@ export function apply(ctx, config) {
    * 引用名沿用 DSH 的 credential-ref 约定（形如环境变量名）。
    */
   async function jevKey(reference) {
-    const name = typeof reference === 'string' && reference !== '' ? reference : DEFAULT_JEV_API_KEY_ENV
+    const name = typeof reference === 'string' && reference !== '' ? reference : JEV_KEY_REF
     // 顺序跟宿主凭据服务一致：文件优先，环境变量兜底。
     // 反过来的话，面板写进凭据库的 Key 会被同名环境变量盖住，状态显示与实际生效对不上。
     try {
@@ -836,28 +836,12 @@ export function apply(ctx, config) {
     return false
   }
 
-  /** 面板专用引用名：Jev 的 Key 单独存，不碰 TokenFlux provider 共用的那个。 */
-  const PANEL_KEY_REF = 'TOKENFLUX_JEV_KEY'
-  /** 旧默认名。它与 provider 的 apiKeyEnv 共用，面板不往这里写。 */
-  const SHARED_KEY_REF = 'TOKENFLUX_API_KEY'
-
   /**
-   * 面板里填的 Key 落到哪个凭据引用上。
-   * UI 不再暴露引用名，只跟已保存的配置走；没有配置时用默认名。
+   * 判定实际读哪个凭据引用：跟已保存的配置走，没有配置时用 JEV_KEY_REF。
+   * UI 不暴露引用名。
    */
   function keyRef(now) {
-    return typeof now?.jevApiKeyEnv === 'string' && now.jevApiKeyEnv !== '' ? now.jevApiKeyEnv : DEFAULT_JEV_API_KEY_ENV
-  }
-
-  /**
-   * 面板写入的目标引用。
-   *
-   * 旧配置的引用名是 TOKENFLUX_API_KEY，那是 TokenFlux provider 也在用的 key：
-   * 把 Jev 的 key 写进去会把模型通道顶掉。遇到它就转到 Jev 专用名，并把配置改过去。
-   */
-  function panelKeyRef(now) {
-    const ref = keyRef(now)
-    return ref === SHARED_KEY_REF ? PANEL_KEY_REF : ref
+    return typeof now?.jevApiKeyEnv === 'string' && now.jevApiKeyEnv !== '' ? now.jevApiKeyEnv : JEV_KEY_REF
   }
 
   /** 宿主凭据服务；没有 set 能力时当作不可写。 */
@@ -875,7 +859,7 @@ export function apply(ctx, config) {
    * 描述失败当成未配置，面板据此显示「未配置」。
    */
   async function keyStatus(now) {
-    const ref = panelKeyRef(now)
+    const ref = keyRef(now)
     const service = credentialsService()
     let described
     try {
@@ -891,17 +875,18 @@ export function apply(ctx, config) {
     }
   }
 
-  /** 把 Key 写进凭据库。值只进不返，失败带原因。 */
+  /**
+   * 把 Key 写进凭据库。值只进不返，失败带原因。
+   *
+   * 写入目标是 JEV_KEY_REF。配置里存着别的引用名时，写完把它改过来，
+   * 否则判定还在读旧名字，Key 看着保存了却不生效。
+   */
   async function saveKey(now, value) {
     const current = keyRef(now)
-    const ref = panelKeyRef(now)
+    const ref = JEV_KEY_REF
     const service = credentialsService()
     if (service === undefined || typeof service.set !== 'function') {
       return { ok: false, code: 503, detail: '宿主没有可写的凭据服务，Key 存不进去' }
-    }
-    // 引用名会被写进凭据文件，文法不对会让整份文件解析失败，先挡住。
-    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(ref)) {
-      return { ok: false, code: 400, detail: `凭据名不合法：${ref}` }
     }
     try {
       await service.set(ref, value)
@@ -911,7 +896,6 @@ export function apply(ctx, config) {
       // 报错原样回浏览器前先把 Key 值抹掉，换别的凭据实现也不会把值带出去。
       return { ok: false, code: 503, detail: `凭据写入失败：${message.split(value).join('***')}` }
     }
-    // 引用名换过就落回配置，否则判定还在读旧名字，Key 看似保存其实不生效。
     if (ref !== current) {
       try {
         const settings = ctx.get('settings')
