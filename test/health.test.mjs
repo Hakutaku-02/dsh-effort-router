@@ -2,25 +2,21 @@
  * 判定服务的可用性状态机：拉起后要等就绪，服务后来起来了状态要跟着回来。
  *
  * 这两条是重启验证里暴露的问题：探一次就判死会把状态永久卡在 failed，
- * 服务明明健康却显示失败。
+ * 服务明明健康却显示失败。判定在 hold 里跑，所以「判定生效」看的是会话选择被写成了什么。
  */
 import { createServer } from 'node:http'
 import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { apply } from '../index.js'
+import { callRoute, makeAgent, makeChecker, makeContext } from './fake-host.mjs'
 
 process.env.ROUTER_EFFORT_LOG = `${tmpdir()}/router-effort-test.log`
 process.env.ROUTER_EFFORT_HOME = mkdtempSync(join(tmpdir(), 'effort-router-home-'))
 delete process.env.ROUTER_EFFORT_STARTUP_WAIT_MS
 delete process.env.ROUTER_EFFORT_START_WAIT_MS
 
-let failures = 0
-function check(name, actual, expected) {
-  const ok = JSON.stringify(actual) === JSON.stringify(expected)
-  if (!ok) failures += 1
-  console.log(`${ok ? 'ok  ' : 'FAIL'} ${name}: ${JSON.stringify(actual)}${ok ? '' : ` (期望 ${JSON.stringify(expected)})`}`)
-}
+const { check, done } = makeChecker()
 
 /** 假判定服务：跑起来会写 pid 文件，方便测试收尾时杀掉它。 */
 function fakeServiceSource(pidFile) {
@@ -47,38 +43,24 @@ createServer((req, res) => {
 `
 }
 
-/** 假上下文：带 webServer 收集路由，带 llm 给档位，带 sessionProjections 给模型。 */
-function fakeContext() {
-  const handlers = new Map()
-  const routes = []
-  return {
-    handlers,
-    routes,
-    on(event, handler) { handlers.set(event, handler) },
-    get(name) {
-      if (name === 'llm') {
-        return { async resolveModelInfo() { return { reasoning: { efforts: [{ id: 'low' }, { id: 'high' }, { id: 'max' }] } } } }
-      }
-      if (name === 'sessionProjections') {
-        return { stateOf: () => ({ lastUsed: { provider: 'p', model: 'm' } }) }
-      }
-      return undefined
-    },
-    inject(services, fn) {
-      if (services.includes('webServer')) {
-        fn({ get: () => ({ register(options) { routes.push(options); return () => {} } }), effect(run) { run() } })
-      }
-    },
-    effect(fn) { fn() },
-  }
+/** 读状态接口。 */
+async function judgeState(ctx) {
+  const got = await callRoute(ctx, '/effort-router/judge', undefined, { method: 'GET', headers: {} })
+  return got.body
 }
 
-function judgeState(ctx) {
-  const route = ctx.routes.find((entry) => entry.path === '/effort-router/judge')
-  if (route === undefined) return undefined
-  let body = ''
-  route.handler({ method: 'GET' }, { statusCode: 0, setHeader() {}, end(text) { body = text } })
-  return body === '' ? undefined : JSON.parse(body)
+const message = (id, text = '重构这段代码') => ({
+  id,
+  role: 'user',
+  content: [{ type: 'text', text }],
+  source: { kind: 'user' },
+})
+
+/** 跑一条用户消息的 hold，返回写完之后的会话强度。 */
+async function heldEffort(ctx, agent, id = 'm1') {
+  ctx.emit('agent/inbox/inserted', { agent, message: message(id) })
+  await agent.settled
+  return agent.model.current()?.reasoningEffort
 }
 
 /** 拿一个空闲端口：起服务问内核，然后关掉。 */
@@ -93,7 +75,7 @@ async function freePort() {
 async function waitFor(predicate, timeoutMs = 8000) {
   const deadline = Date.now() + timeoutMs
   for (;;) {
-    const value = predicate()
+    const value = await predicate()
     if (value !== undefined && value !== false) return value
     if (Date.now() >= deadline) return undefined
     await new Promise((resolve) => setTimeout(resolve, 100))
@@ -110,7 +92,7 @@ try {
   // 场景一：按配置路径拉起，等它就绪，状态变 up
   {
     const port = await freePort()
-    const ctx = fakeContext()
+    const ctx = makeContext()
     apply(ctx, {
       mode: 'auto',
       autoStart: true,
@@ -121,22 +103,19 @@ try {
       startupWaitMs: 0,
       startWaitMs: 8000,
     })
-    const state = await waitFor(() => judgeState(ctx)?.state === 'up' ? 'up' : undefined)
+    const state = await waitFor(async () => (await judgeState(ctx))?.state === 'up' ? 'up' : undefined)
     check('拉起并等待: 状态变 up', state, 'up')
     spawnedPid = Number(readFileSync(pidFile, 'utf8'))
 
-    // 拉起之后判定能拿到档位
-    const agent = { session: { id: 'session-health', requestHeader: () => ({ config: { provider: 'p', model: 'm' } }) } }
-    ctx.handlers.get('agent/inbox/claimed')({ agent, message: { content: [{ type: 'text', text: '重构这段代码' }] } })
-    const config = await ctx.handlers.get('agent/request')({ agent, turn: 1, step: 1 },
-      async () => ({ provider: 'p', model: 'm', reasoningEffort: 'low' }))
-    check('拉起之后: 判定生效', config.reasoningEffort, 'high')
+    // 拉起之后判定能拿到档位，写进会话选择
+    const agent = makeAgent({ id: 'session-health', provider: 'p', model: 'm', reasoningEffort: 'low' })
+    check('拉起之后: 判定生效', await heldEffort(ctx, agent), 'high')
   }
 
   // 场景二：启动时服务不在线，之后起来了，判定成功要把状态刷回来
   {
     const port = await freePort()
-    const ctx = fakeContext()
+    const ctx = makeContext()
     apply(ctx, {
       mode: 'auto',
       autoStart: false,
@@ -144,7 +123,7 @@ try {
       judgeUrl: `http://127.0.0.1:${port}/judge`,
       startupWaitMs: 0,
     })
-    const down = await waitFor(() => judgeState(ctx)?.state === 'down' ? 'down' : undefined, 3000)
+    const down = await waitFor(async () => (await judgeState(ctx))?.state === 'down' ? 'down' : undefined, 3000)
     check('启动时不在线: 状态 down', down, 'down')
 
     // 服务晚到
@@ -154,12 +133,9 @@ try {
     })
     await new Promise((resolve) => server.listen(port, '127.0.0.1', resolve))
 
-    const agent = { session: { id: 'session-late', requestHeader: () => ({ config: { provider: 'p', model: 'm' } }) } }
-    ctx.handlers.get('agent/inbox/claimed')({ agent, message: { content: [{ type: 'text', text: '再看看这段' }] } })
-    const config = await ctx.handlers.get('agent/request')({ agent, turn: 1, step: 1 },
-      async () => ({ provider: 'p', model: 'm', reasoningEffort: 'low' }))
-    check('服务晚到: 判定生效', config.reasoningEffort, 'max')
-    check('服务晚到: 状态刷回 up', judgeState(ctx)?.state, 'up')
+    const agent = makeAgent({ id: 'session-late', provider: 'p', model: 'm', reasoningEffort: 'low' })
+    check('服务晚到: 判定生效', await heldEffort(ctx, agent), 'max')
+    check('服务晚到: 状态刷回 up', (await judgeState(ctx))?.state, 'up')
     await new Promise((resolve) => server.close(resolve))
   }
 } finally {
@@ -170,5 +146,4 @@ try {
   }
 }
 
-console.log(failures === 0 ? '\n全部通过' : `\n${failures} 个失败`)
-process.exit(failures === 0 ? 0 : 1)
+done()

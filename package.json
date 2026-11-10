@@ -1,6 +1,6 @@
 {
   "name": "dsh-effort-router",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "按任务难度调整当前模型的思考强度，provider 与 model 保持用户所选",
   "type": "module",
   "main": "index.js",
@@ -21,7 +21,7 @@
   ],
   "engines": {
     "node": ">=18",
-    "dsh": ">=0.2.0-rc.2"
+    "dsh": ">=0.2.2-rc.1"
   },
   "dsh": {
     "bundle": {
@@ -32,7 +32,7 @@
     }
   },
   "peerDependencies": {
-    "@deepseek-ai/schemastery": "~3.18.4"
+    "@deepseek-ai/schemastery": ">=3.18.4 <4"
   },
   "dependencies": {
     "dsh-router-laya": "^2.2.1"

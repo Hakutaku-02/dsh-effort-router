@@ -4,11 +4,12 @@
  * 它只改一个字段：`reasoningEffort`。provider 和 model 保持你（或 agent 默认模型）
  * 选的那个，所以换任何厂商、任何新加的 provider 都自动适用。
  *
- * 流程：每轮第一次请求时，把用户这句话发给本机判定服务，拿一个档位
- * （low / high / max），再把档位映射成强度名，最后在目标模型真正支持的强度里
- * 挑一个不超过目标的、最强的那个。
+ * 流程：用户消息进 inbox 时把这句话发给判定服务，拿一个档位（low / high / max），
+ * 把档位映射成强度名，在目标模型真正支持的强度里挑一个落位，用
+ * `agent.model.select()` 写进会话选择。判定跑在 `agent.runMaintenance()` 里，本轮唤醒
+ * 被扣住到写完为止——0.2.2 在 pre-step 之前就快照模型选择，晚于这个点写只对下一步生效。
  *
- * 判定服务不可用时什么都不做，请求保持原样。
+ * 判定服务不可用时会落兜底档位（该会话上一轮的档位，没有就用 tiers.fallback），不阻塞这一轮。
  */
 
 import { spawn } from 'node:child_process'
@@ -24,6 +25,30 @@ export const name = 'effort-router'
 
 const DEFAULT_JUDGE = 'http://127.0.0.1:8765/judge'
 const JUDGE_TIMEOUT_MS = 20000
+/**
+ * hold 阶段等判定的上限。
+ *
+ * 判定跑在 `runMaintenance` 里，本轮唤醒被扣住，第一个 token 要等判定结束才出来，
+ * 等待时间就是判定耗时。所以这里的预算必须短：宁可这一轮落兜底档，也不要把用户晾着。
+ *
+ * 两个后端分开给：本地判定服务在同机同进程旁，几十毫秒就回；Jev 是公网决策端点，
+ * 实测单次 1 到 2 秒（含排队）。用同一个值，要么本地白等，要么 Jev 每轮都超时兜底。
+ */
+const JUDGE_HOLD_TIMEOUT_MS = 1200
+/** Jev 的 hold 预算：覆盖公网往返与端点排队，仍留出「超时也要放行」的余地。 */
+const JEV_HOLD_TIMEOUT_MS = 3000
+/** 会话级内存表的容量上限。会话数是外部输入，不设上限这两张表会一直涨。 */
+const MAX_SESSION_ENTRIES = 200
+/**
+ * 凭据写入的重试间隔。
+ *
+ * 宿主用「写临时文件 + rename」提交凭据文件。Windows 上杀软扫描新文件、编辑器打开着
+ * 目标文件，都会让 rename 短暂报 EPERM/EACCES/EBUSY；宿主自己只重试约 1 秒，不够。
+ * 这里在调用层再补几次，用户不用知道发生了什么就存进去了。
+ */
+const CREDENTIAL_WRITE_RETRY_MS = [400, 900, 1800]
+/** Windows 上 rename 被暂时挡住的错误码。 */
+const TRANSIENT_CREDENTIAL_CODES = ['EPERM', 'EACCES', 'EBUSY']
 const MAX_TASK_CHARS = 4000
 const SERVICE_LOG_PATH = `${tmpdir()}/laya-router-service.log`
 /** 首次部署的完整输出。pip、权重下载、服务启动日志都在这里。 */
@@ -86,6 +111,8 @@ export const Config = z.object({
   jevApiKeyEnv: z.string().default(JEV_KEY_REF).volatile(),
   jevConfidence: z.number().default(DEFAULT_JEV_CONFIDENCE).volatile(),
   jevTimeoutMs: z.number().default(JEV_TIMEOUT_MS),
+  /** 判定预算。判定跑在 hold 里，这个值直接决定首 token 晚到多久。 */
+  judgeTimeoutMs: z.number().default(JUDGE_HOLD_TIMEOUT_MS).volatile(),
   notify: z.string().default('').volatile(),
   tiers: z.dict(z.string()).volatile(),
   autoStart: z.boolean(),
@@ -198,8 +225,16 @@ function textOf(message) {
     .trim()
 }
 
-function sessionKey(payload) {
-  const session = payload && payload.agent && payload.agent.session
+/** 一批消息的纯文本，逐条拼起来。判定看的是整轮输入，不是第一条。 */
+function textsOf(messages) {
+  return (Array.isArray(messages) ? messages : [])
+    .map((message) => textOf(message))
+    .filter((text) => text !== '')
+    .join('\n')
+}
+
+function sessionKeyOf(agent) {
+  const session = agent && agent.session
   return (session && (session.id || session.sessionId)) || 'global'
 }
 
@@ -208,43 +243,27 @@ function log(message) {
 }
 
 /**
- * 本轮真正要用的模型。
+ * 本轮固定下来的模型路由。
  *
- * 上一次请求头里的模型是上一轮的，用户这一轮换了模型就会写错。会话的模型选择
- * 投影里 `pending` 才是尚未落地的本轮选择，没有 pending 时才用 `lastUsed`。
- * 投影读不到（没有 session controller 的宿主）就退回请求头。
+ * 0.2.2 起 `agent/pre-step` 的 payload 直接带 `modelSelection`：它在 inbox 被认领、
+ * `model.current()` 快照之后才派发，必定是本轮的，且已经包含会话里写进去的强度。
+ * 不再读投影，也不再退回请求头——那两条给出的都是上一轮的模型。
  */
-function currentRoute(ctx, payload) {
-  const session = payload && payload.agent && payload.agent.session
-  if (!session) return undefined
-  try {
-    // strict=false：宿主没挂 session controller 时返回 undefined，而不是抛错。
-    const projections = ctx.get('sessionProjections', false)
-    const state = projections && typeof projections.stateOf === 'function'
-      ? projections.stateOf(session, 'modelSelection')
-      : undefined
-    const chosen = state?.pending ?? state?.lastUsed
-    if (chosen && chosen.provider && chosen.model) {
-      return { provider: chosen.provider, model: chosen.model, reasoningEffort: chosen.reasoningEffort }
-    }
-  } catch {
-    /* 投影服务不在，走请求头 */
+function currentRoute(payload) {
+  const selection = payload === null || payload === undefined ? undefined : payload.modelSelection
+  if (selection === undefined || selection === null) return undefined
+  if (!selection.provider || !selection.model) return undefined
+  return {
+    provider: selection.provider,
+    model: selection.model,
+    reasoningEffort: selection.reasoningEffort,
   }
-  try {
-    const config = typeof session.requestHeader === 'function' ? session.requestHeader()?.config : undefined
-    if (config && config.provider && config.model) {
-      return { provider: config.provider, model: config.model, reasoningEffort: config.reasoningEffort }
-    }
-  } catch {
-    /* 没有请求头 */
-  }
-  return undefined
 }
 
 /** 问判定服务要一个档位；任何失败都返回 null。成功时把 state 刷成 up。 */
-async function judgeTier(url, task, signal, state) {
+async function judgeTier(url, task, signal, state, timeoutMs) {
   if (typeof task !== 'string' || task === '') return null
-  const timeout = AbortSignal.timeout(JUDGE_TIMEOUT_MS)
+  const timeout = AbortSignal.timeout(toMs(timeoutMs, JUDGE_TIMEOUT_MS))
   if (signal && typeof signal.addEventListener === 'function') {
     signal.addEventListener('abort', () => timeout.abort?.(), { once: true })
   }
@@ -256,19 +275,25 @@ async function judgeTier(url, task, signal, state) {
       signal: timeout,
     })
     if (!response.ok) {
-      log(`判定服务返回 HTTP ${response.status}，本轮不改强度`)
+      log(`判定服务返回 HTTP ${response.status}，本轮按兜底档处理`)
       return null
     }
     const body = await response.json()
-    const tier = typeof body?.tier === 'string' ? body.tier.trim().toLowerCase() : ''
-    if (tier !== '' && state !== undefined && state !== null) {
+    const answer = typeof body?.tier === 'string' ? body.tier.trim().toLowerCase() : ''
+    // 只认协议里的三档。回了别的词按判定失败处理，与设置页探活的判断保持一致，
+    // 否则同一个服务在探活里被拒、在判定里却被当成中间档。
+    if (!JUDGE_TIERS.includes(answer)) {
+      log(`判定服务的档位不认识（${answer === '' ? '空' : answer}），本轮按兜底档处理`)
+      return null
+    }
+    if (state !== undefined && state !== null) {
       // 服务答得上话，状态就该是 up。启动阶段那一次探活失败不该永久定死状态。
       state.state = 'up'
       state.detail = ''
     }
-    return tier === '' ? null : tier
+    return answer
   } catch (error) {
-    log(`判定服务不可用（${error && error.message ? error.message : error}），本轮不改强度`)
+    log(`判定服务不可用（${error && error.message ? error.message : error}），本轮按兜底档处理`)
     return null
   }
 }
@@ -350,6 +375,29 @@ function toMs(value, fallback) {
 }
 
 /**
+ * 给不接 signal 的异步调用套一个超时。
+ *
+ * hold 期间本轮唤醒是被扣住的，任何一步挂住都会把 agent 卡在 maintenance 里出不来。
+ * 凭据服务这类调用不接受 AbortSignal，只能靠这里兜住。超时返回 undefined。
+ */
+function withTimeout(promise, ms) {
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => resolve(undefined), Math.max(toMs(ms, 0), 0))
+    timer.unref?.()
+    promise.then(
+      (value) => { clearTimeout(timer); resolve(value) },
+      () => { clearTimeout(timer); resolve(undefined) },
+    )
+  })
+}
+
+/** 凭据写入是否被临时挡住（Windows 上 rename 的典型失败）。 */
+function isTransientCredentialError(error) {
+  const code = error !== null && typeof error === 'object' ? error.code : undefined
+  return TRANSIENT_CREDENTIAL_CODES.includes(code)
+}
+
+/**
  * 等判定服务就绪：每 stepMs 探一次，直到超时。
  *
  * 冷启动要加载权重，约 70 秒，所以拉起之后必须等，不能探一次就判死。
@@ -370,9 +418,9 @@ async function waitForService(base, timeoutMs, stepMs = 2000) {
  * 子代理的强度由主代理决定，这里再改一遍会覆盖它。字段读不到就当不是子代理，
  * 行为与没有这段判断时一致。
  */
-function isSubagent(payload) {
+function isSubagent(agent) {
   try {
-    const session = payload && payload.agent && payload.agent.session
+    const session = agent && agent.session
     const header = session && typeof session.header === 'object' ? session.header : undefined
     return header !== undefined && header !== null && header.origin === 'subagent'
   } catch {
@@ -445,12 +493,6 @@ function recentPath() {
  */
 function bareSession(value) {
   return String(value ?? '').replace(/^session-/, '')
-}
-
-/** 轮次号：payload 里没有、或者不是数字时给 undefined，免得去重逻辑把两轮误判成同一轮。 */
-function turnOf(payload) {
-  const turn = payload !== null && payload !== undefined ? payload.turn : undefined
-  return typeof turn === 'number' ? turn : undefined
 }
 
 /** 读回上次落盘的判定。文件不存在、坏掉、结构不对都当空表；只留最新的 limit 条。 */
@@ -606,10 +648,13 @@ export function apply(ctx, config) {
     const tierSource = values?.tiers !== undefined && values.tiers !== null && typeof values.tiers === 'object'
       ? { ...tiers, ...values.tiers }
       : tiers
+    const judgeSource = JUDGE_SOURCES.includes(values?.judgeSource)
+      ? values.judgeSource
+      : (valueOf(cfg.judgeSource, 'local') === 'jev' ? 'jev' : 'local')
     return {
       enabled: typeof values?.enabled === 'boolean' ? values.enabled : valueOf(cfg.enabled, true) !== false,
       mode: MODES.includes(values?.mode) ? values.mode : mode.current,
-      judgeSource: JUDGE_SOURCES.includes(values?.judgeSource) ? values.judgeSource : (valueOf(cfg.judgeSource, 'local') === 'jev' ? 'jev' : 'local'),
+      judgeSource,
       judgeUrl: typeof values?.judgeUrl === 'string' && values.judgeUrl !== '' ? values.judgeUrl : mountedJudgeUrl,
       notify: typeof values?.notify === 'string' ? values.notify : String(valueOf(cfg.notify, '') ?? ''),
       tiers: { ...DEFAULT_TIERS, ...tierSource },
@@ -618,24 +663,33 @@ export function apply(ctx, config) {
       jevApiKeyEnv: typeof values?.jevApiKeyEnv === 'string' && values.jevApiKeyEnv !== '' ? values.jevApiKeyEnv : (valueOf(cfg.jevApiKeyEnv, '') || JEV_KEY_REF),
       jevConfidence: Number.isFinite(Number(values?.jevConfidence)) ? Number(values.jevConfidence) : toMs(cfg.jevConfidence, DEFAULT_JEV_CONFIDENCE),
       jevTimeoutMs: toMs(values?.jevTimeoutMs ?? cfg.jevTimeoutMs, JEV_TIMEOUT_MS),
+      // 没配预算时按后端给默认值：Jev 是公网往返，本地服务是同机调用。
+      judgeTimeoutMs: toMs(values?.judgeTimeoutMs ?? cfg.judgeTimeoutMs, judgeSource === 'jev' ? JEV_HOLD_TIMEOUT_MS : JUDGE_HOLD_TIMEOUT_MS),
     }
   }
 
   trace(`mounted mode=${mode.current} judge=${mountedJudgeUrl} entry=${entryId}`)
 
-  /** 判定服务的状态，给 /effort-router/judge 看。 */
+  /** 判定后端的可用性，给 /effort-router/judge 看。 */
   const judge = { state: 'unknown', detail: '' }
 
-  /** 本轮用户在退让前的原话。inbox 被认领时就记下来，请求时读不到消息体。 */
-  const tasks = new Map()
-  /** 会话 -> { turn, tier }，一轮只判一次。 */
+  /**
+   * 记一次后端的可用性。
+   *
+   * 本地服务的状态由 `ensureJudge` 维护；Jev 没有探活流程，就由每次真实判定的结果刷新，
+   * 这样状态接口报的就是「上一轮到底连通没有」，而不是一个与 Jev 无关的本地服务状态。
+   */
+  function noteBackend(state, detail) {
+    judge.state = state
+    judge.detail = detail
+  }
+
+  /** 会话 -> { turn, tier, effort, baseline }：本轮判定结果。turn 为 undefined 表示留给下一轮。 */
   const verdicts = new Map()
-  /** 会话 -> { turn, effort }，记下我们自己写过的强度，用来区分“用户改的”和“我们写的”。 */
+  /** 会话 -> { effort }，记下我们自己写过的强度，用来区分“用户改的”和“我们写的”。 */
   const written = new Map()
   /** provider/model -> { at, list }，档位解析结果，带寿命。 */
   const infos = new Map()
-  /** 会话 -> 本轮 pre-step 判出的档位，供同一步的请求复用，避免问两次。 */
-  const pending = new Map()
   /** 会话 -> 最近一次判定，供输入框旁的芯片显示。启动时从磁盘读回，重启后芯片不会空。 */
   const recent = loadRecent(MAX_RECENT)
   /** 浏览器半边最后一次报到的时间、它带上来的会话参数，以及组件收到的 props 键名。 */
@@ -645,41 +699,48 @@ export function apply(ctx, config) {
   const saveState = { at: 0 }
 
   /**
+   * 写会话级内存表，超过容量上限时丢最早的一条。
+   * Map 保持插入顺序，最早插入的那条就是最该淘汰的。
+   */
+  function remember(map, key, value) {
+    map.delete(key)
+    map.set(key, value)
+    if (map.size <= MAX_SESSION_ENTRIES) return
+    const oldest = map.keys().next()
+    if (oldest.done !== true) map.delete(oldest.value)
+  }
+
+  /**
    * 记一次判定结果。芯片读的是这里，不读会话日志。
    *
-   * 两件事要靠 turn 区分开：
-   * - 同一轮里 agent/request 每个工具步骤都会调一次，档位不该变，这时只刷新时间，
-   *   不动 prevTier，否则刚记下的「low → high」会被本轮的重复调用抹成「high」；
-   * - 到了新一轮，才把上一轮的档位滚进 prevTier，芯片据此显示跨档变化。
+   * prevTier 记上一次记下的档位，芯片据此显示 low → high。hold 阶段还不知道轮次号
+   * （turn 为空），pre-step 补判时才拿得到；一轮里若插话又判了一次，就按最后一次记。
    *
-   * 落盘条件：档位变了，或者距上次落盘超过 SAVE_INTERVAL_MS。后者保证活跃会话在磁盘上
-   * 不会变成「最久没更新」而被容量淘汰挤掉。
+   * owned 记的是这条 record 的强度是不是插件自己写进去的：用户钉住的强度即使被原样写回，
+   * 也不算我们的，下一轮不能因此把它降下去。
+   *
+   * 落盘条件：档位或归属变了，或者距上次落盘超过 SAVE_INTERVAL_MS。后者保证活跃会话在
+   * 磁盘上不会变成「最久没更新」而被容量淘汰挤掉。
    */
-  function recordVerdict(key, tier, effort, provider, model, turn) {
+  function recordVerdict({ key, tier, effort, provider, model, turn, owned }) {
     const previous = recent.get(key)
     const now = Date.now()
-    const sameTurn = previous !== undefined && turn !== undefined && previous.turn === turn
-    let changed = false
-
-    if (sameTurn) {
-      // 同一轮的工具步骤：档位不变，只刷新时间与磁盘上的 at。
-      recent.set(key, { ...previous, at: now })
-    } else {
-      changed = previous === undefined
-        || previous.tier !== tier
-        || previous.effort !== effort
-        || previous.provider !== provider
-        || previous.model !== model
-      recent.set(key, {
-        tier,
-        effort,
-        provider,
-        model,
-        at: now,
-        prevTier: previous === undefined ? null : previous.tier,
-        turn,
-      })
-    }
+    const changed = previous === undefined
+      || previous.tier !== tier
+      || previous.effort !== effort
+      || previous.provider !== provider
+      || previous.model !== model
+      || previous.owned !== (owned === true)
+    recent.set(key, {
+      tier,
+      effort,
+      provider,
+      model,
+      at: now,
+      prevTier: previous === undefined ? null : previous.tier,
+      turn,
+      owned: owned === true,
+    })
 
     // 内存也要裁：只在读盘时截断会让这张表随着会话数一直涨。
     if (recent.size > MAX_RECENT) {
@@ -739,14 +800,22 @@ export function apply(ctx, config) {
    * 置信度低于阈值时在概率最高的两档里取更强的那个：宁可高估，不低估。
    * 任何失败都返回 null，调用方保持原强度。
    */
-  async function askJev(task, signal, now) {
+  async function askJev(task, signal, now, timeoutMs) {
     if (typeof task !== 'string' || task === '') return null
-    const key = await jevKey(now.jevApiKeyEnv)
-    if (key === '') {
-      log('Jev 没有可用凭据，本轮不改强度')
+    // 没给预算时用配置里的 Jev 超时；给了（hold 阶段）就用给的，且不叠加。
+    const budget = toMs(timeoutMs, toMs(now.jevTimeoutMs, JEV_TIMEOUT_MS))
+    // 一次判定总共只有 budget 这么多时间，解析凭据也算在里面。
+    // 两段各给一次 budget 的话，最坏情况是 hold 被扣住两倍预算。
+    const deadline = Date.now() + budget
+    // 凭据服务不接受 signal：挂住的话 hold 永远结束不了，这里必须兜一层超时。
+    const key = await withTimeout(jevKey(now.jevApiKeyEnv), budget)
+    if (typeof key !== 'string' || key === '') {
+      noteBackend('down', `没有可用凭据：${now.jevApiKeyEnv}`)
+      log('Jev 没有可用凭据，本轮按兜底档处理')
       return null
     }
-    const timeout = AbortSignal.timeout(toMs(now.jevTimeoutMs, JEV_TIMEOUT_MS))
+    // 剩余预算：凭据解析花掉的时间从这里扣。
+    const timeout = AbortSignal.timeout(Math.max(0, deadline - Date.now()))
     if (signal && typeof signal.addEventListener === 'function') {
       signal.addEventListener('abort', () => timeout.abort?.(), { once: true })
     }
@@ -768,7 +837,8 @@ export function apply(ctx, config) {
         signal: timeout,
       })
       if (!response.ok) {
-        log(`Jev 返回 HTTP ${response.status}，本轮不改强度`)
+        noteBackend('down', `HTTP ${response.status}`)
+        log(`Jev 返回 HTTP ${response.status}，本轮按兜底档处理`)
         return null
       }
       const body = await response.json()
@@ -777,9 +847,11 @@ export function apply(ctx, config) {
         ? answer.choice.trim().toLowerCase()
         : ''
       if (!TIER_KEYS.includes(choice)) {
-        log(`Jev 的答案不是已知档位（${choice === '' ? '空' : choice}），本轮不改强度`)
+        noteBackend('down', `答案不是已知档位（${choice === '' ? '空' : choice}）`)
+        log(`Jev 的答案不是已知档位（${choice === '' ? '空' : choice}），本轮按兜底档处理`)
         return null
       }
+      noteBackend('up', '')
       const confidence = Number(answer.confidence)
       const threshold = Number.isFinite(now.jevConfidence) ? now.jevConfidence : DEFAULT_JEV_CONFIDENCE
       if (Number.isFinite(confidence) && confidence < threshold) {
@@ -796,7 +868,8 @@ export function apply(ctx, config) {
       }
       return choice
     } catch (error) {
-      log(`Jev 不可用（${error && error.message ? error.message : error}），本轮不改强度`)
+      noteBackend('down', error && error.message ? error.message : String(error))
+      log(`Jev 不可用（${error && error.message ? error.message : error}），本轮按兜底档处理`)
       return null
     }
   }
@@ -804,36 +877,116 @@ export function apply(ctx, config) {
   /**
    * 把这一轮的强度写进会话的模型选择。
    *
-   * 这是让强度真正到达请求的唯一路径：`dsh-agent` 的 model-selection 监听会在
-   * `agent/request` 上无条件剥掉继承来的 `reasoningEffort`（用户没选档位时清空，
-   * 选了就用那个固定值），只认 `selection.assembled.reasoningEffort`。
-   * 在 pre-step（早于 prompt assemble）把值写进 selection，assemble 时快照进去，
-   * 请求就带着它发出去。实测：不写 selection 时 anthropic 请求体里连 thinking 都没有。
+   * 0.2.2 唯一的写入口是 `agent.model.select()`：它 append 一条 `model/selection`，
+   * 会话级的 model-selection 监听把它折成 pending，下一次 `model.current()` 快照到的
+   * 就是新值。所以写入必须发生在 preStep 之前——这就是写入点挪到 hold 阶段的原因。
    *
-   * 服务名在不同运行时可能不同，按顺序试；都没有就返回 false，本轮不改强度。
+   * select 不做任何校验：空 provider、模型不认识的强度名都写得进去，之后在
+   * `prepareRequest` 或 `llm.prepareCall` 才炸，离写入点很远。所以调用方必须先用
+   * 模型自己声明的强度列表选好值（`pickEffortFor`），这里只负责写。
    */
-  function applySelection(ctx, agent, provider, model, reasoningEffort) {
-    if (agent === undefined || agent === null) return false
-    for (const name of ['sessionController', 'agents']) {
-      let service
-      try {
-        service = ctx.get(name)
-      } catch {
-        service = undefined
-      }
-      if (service === undefined || service === null) continue
-      const apply = service.selectForNextRequest
-      if (typeof apply !== 'function') continue
-      try {
-        apply.call(service, agent, { provider, model, reasoningEffort })
-        trace(`selection: 写入 ${provider}/${model} → ${reasoningEffort}（via ${name}）`)
-        return true
-      } catch (error) {
-        trace(`selection: 写入失败（${name}）：${error && error.message ? error.message : error}`)
-      }
+  function applySelection(agent, provider, model, reasoningEffort) {
+    const api = agent === null || agent === undefined ? undefined : agent.model
+    if (api === undefined || api === null || typeof api.select !== 'function') {
+      trace('selection: agent 没有 model.select，本轮不写会话选择')
+      return false
     }
-    trace('selection: 没有可用的写入接口，本轮只在内存里改')
-    return false
+    try {
+      api.select({ provider, model, reasoningEffort })
+      trace(`selection: 写入 ${provider}/${model} → ${reasoningEffort}（agent.model.select）`)
+      return true
+    } catch (error) {
+      trace(`selection: 写入失败（agent.model.select）：${error && error.message ? error.message : error}`)
+      return false
+    }
+  }
+
+  /**
+   * 这一轮能不能直接覆盖会话里的强度。
+   *
+   * 会话里还没有任何选择时，选择器上的是模型默认值，可以覆盖。已经有选择时：
+   * - 值等于我们自己写过的（本进程的 written，或落盘历史里 owned 为 true 的那条），可以覆盖；
+   * - 值等于 agent 的默认强度（重启后会话记录里的 lastUsed 多半就是这个），可以覆盖；
+   * - 其余情况当作用户自己拧的，只升不降。
+   *
+   * `recordedSelection()` 与 `options` 只在运行时的 AgentModel 上有，公开的 Model 接口
+   * 只声明了 `current()` 与 `select()`。两个都读不到时按「不是我们写的」处理：
+   * 判定结果只能往上抬，比现状弱就保留现状。宁可少降，也不把用户手动调的档顶掉。
+   */
+  function ownsSelection(agent, key, currentEffort) {
+    // 进程内自记账不依赖宿主 API：先看这个值是不是我们自己写进去的。
+    const last = written.get(key)
+    if (last !== undefined && last.effort === currentEffort) return true
+    let readable = false
+    let recorded = null
+    let fallbackEffort
+    try {
+      const api = agent === null || agent === undefined ? undefined : agent.model
+      if (api !== undefined && api !== null && typeof api.recordedSelection === 'function') {
+        recorded = api.recordedSelection()
+        fallbackEffort = api.options?.reasoningEffort
+        readable = true
+      }
+    } catch {
+      readable = false
+    }
+    // 读不到会话选择就保守处理：当作不是我们写的，只升不降。
+    if (!readable) return false
+    if (recorded === null || recorded === undefined) return true
+    const saved = recent.get(key)
+    if (saved !== undefined) {
+      // 记录里是别的值，说明用户在我们写过之后又改过：这是用户的选择，按下限处理。
+      if (saved.effort !== currentEffort) return false
+      // 值没变，而且这条确实是我们写的：可以继续接管。
+      if (saved.owned === true) return true
+    }
+    // 没有可认领的历史（或者历史就是当前值但不是我们写的）：等于 agent 默认强度时接管，
+    // 否则当作会话里原有的用户选择。
+    return fallbackEffort !== undefined && recorded.reasoningEffort === fallbackEffort
+  }
+
+  /** 用户自己选过强度时的保守处理：只往上抬，不往下压。 */
+  function onlyRaise(pinned, picked) {
+    const pin = strengthOf(pinned)
+    const want = strengthOf(picked)
+    if (pin === undefined || want === undefined) return picked
+    return want <= pin ? pinned : picked
+  }
+
+  /** 按当前模型声明的强度列表落位；列表拿不到时返回 undefined，也就是不写。 */
+  async function pickEffortFor(provider, model, tier, now) {
+    return pickForTier(await effortsFor(provider, model), tier, now.tiers)
+  }
+
+  /**
+   * 判定档位 → 本轮强度 → 写进会话选择。
+   *
+   * 成功时返回 `{ tier, effort, baseline }`；模型没声明强度、拿不到写入接口、判定期间
+   * 用户换了模型、或者这一轮已经被取消时返回 undefined，请求保持原样。
+   */
+  async function routeEffort(agent, key, route, tier, signal, now, turn) {
+    const picked = await pickEffortFor(route.provider, route.model, tier, now)
+    if (picked === undefined) return undefined
+    if (signal !== undefined && signal !== null && signal.aborted === true) return undefined
+    // 判定期间用户可能换了模型或强度：写回旧选择会把他刚做的操作顶掉，这种轮次直接放弃。
+    // 名字不叫 live：那与本文件里读热改配置的 live() 同名，容易看错。
+    const current = agent.model?.current?.()
+    if (current === undefined || current === null
+      || current.provider !== route.provider || current.model !== route.model
+      || current.reasoningEffort !== route.reasoningEffort) {
+      trace(`selection: 判定期间路由变了（${route.provider}/${route.model} → ${current?.provider ?? '?'}/${current?.model ?? '?'}），本轮不写`)
+      return undefined
+    }
+    const baseline = route.reasoningEffort
+    const ours = ownsSelection(agent, key, baseline)
+    const effort = ours ? picked : onlyRaise(baseline, picked)
+    if (!applySelection(agent, route.provider, route.model, effort)) return undefined
+    // 只在我们真的改过值、或者这个值本来就是我们的时才认领：把用户自己拧的值原样写回去
+    // 不算我们的，否则下一轮就分不清那是用户的下限还是我们写的。
+    const owned = ours || effort !== baseline
+    if (owned) remember(written, key, { effort })
+    recordVerdict({ key, tier, effort, provider: route.provider, model: route.model, turn, owned })
+    return { tier, effort, baseline }
   }
 
   /**
@@ -880,6 +1033,9 @@ export function apply(ctx, config) {
    *
    * 写入目标是 JEV_KEY_REF。配置里存着别的引用名时，写完把它改过来，
    * 否则判定还在读旧名字，Key 看着保存了却不生效。
+   *
+   * 凭据文件被占用时宿主会抛 EPERM/EACCES/EBUSY，这种失败通常几秒内自己消失，
+   * 这里退避重试；一直失败才把原因回给面板。
    */
   async function saveKey(now, value) {
     const current = keyRef(now)
@@ -888,14 +1044,30 @@ export function apply(ctx, config) {
     if (service === undefined || typeof service.set !== 'function') {
       return { ok: false, code: 503, detail: '宿主没有可写的凭据服务，Key 存不进去' }
     }
-    try {
-      await service.set(ref, value)
-      trace(`credentials: 写入 ${ref}`)
-    } catch (error) {
-      const message = error && error.message ? String(error.message) : String(error)
-      // 报错原样回浏览器前先把 Key 值抹掉，换别的凭据实现也不会把值带出去。
-      return { ok: false, code: 503, detail: `凭据写入失败：${message.split(value).join('***')}` }
+    let failure
+    for (let attempt = 0; attempt <= CREDENTIAL_WRITE_RETRY_MS.length; attempt += 1) {
+      try {
+        await service.set(ref, value)
+        failure = undefined
+        break
+      } catch (error) {
+        failure = error
+        const retryable = isTransientCredentialError(error) && attempt < CREDENTIAL_WRITE_RETRY_MS.length
+        if (!retryable) break
+        trace(`credentials: 写入 ${ref} 被临时挡住（${error.code}），${CREDENTIAL_WRITE_RETRY_MS[attempt]}ms 后重试`)
+        await new Promise((resolve) => setTimeout(resolve, CREDENTIAL_WRITE_RETRY_MS[attempt]))
+      }
     }
+    if (failure !== undefined) {
+      const message = failure && failure.message ? String(failure.message) : String(failure)
+      // 报错原样回浏览器前先把 Key 值抹掉，换别的凭据实现也不会把值带出去。
+      const safe = message.split(value).join('***')
+      const detail = isTransientCredentialError(failure)
+        ? `凭据写入失败：凭据文件被其他程序占用或暂时不可写，关掉打开它的编辑器（或让杀软跳过 .dsh 目录）后重试。文件：${credentialsPath()}。原始错误：${safe}`
+        : `凭据写入失败：${safe}`
+      return { ok: false, code: 503, detail }
+    }
+    trace(`credentials: 写入 ${ref}`)
     if (ref !== current) {
       try {
         const settings = ctx.get('settings')
@@ -1005,12 +1177,13 @@ export function apply(ctx, config) {
   }
 
   /**
-   * 问一次判定器要档位。任何后端失败都返回 null，调用方保持原强度。
-   * `now` 是本轮读到的热改值，后端选择与地址都从它取。
+   * 问一次判定器要档位。任何后端失败都返回 null，调用方落兜底档。
+   * `now` 是本轮读到的热改值，后端选择与地址都从它取；`timeoutMs` 是该次调用的预算，
+   * 不给时各自用配置里的超时。
    */
-  async function askJudge(task, signal, now) {
-    if (now.judgeSource === 'jev') return askJev(task, signal, now)
-    return judgeTier(now.judgeUrl, task, signal, judge)
+  async function askJudge(task, signal, now, timeoutMs) {
+    if (now.judgeSource === 'jev') return askJev(task, signal, now, timeoutMs)
+    return judgeTier(now.judgeUrl, task, signal, judge, timeoutMs)
   }
 
   /**
@@ -1070,7 +1243,7 @@ export function apply(ctx, config) {
    *
    * 冷启动要加载权重，约 70 秒；拉起之后用 startWaitMs 等，探一次就判死会把状态永久卡在
    * failed。首次部署较慢（装 CPU 版 torch、下约 850MB 权重），全程在后台跑，宿主的启动和
-   * 请求都不等它。没就绪之前那几轮按“判定失败”处理，也就是不改强度，请求照常发。
+   * 请求都不等它。没就绪之前那几轮按判定失败处理，落兜底档，请求照常发。
    */
   async function ensureJudge() {
     const base = serviceBase(mountedJudgeUrl)
@@ -1098,7 +1271,7 @@ export function apply(ctx, config) {
       if (cfg.provision === false) {
         judge.state = 'down'
         judge.detail = judge.detail || 'provision 已关闭，服务不在线'
-        log('判定服务不在线，provision 关闭，本轮起不改强度')
+        log('判定服务不在线，provision 关闭，本轮起按兜底档处理')
         return
       }
       const source = layaRoot(cfg)
@@ -1130,97 +1303,122 @@ export function apply(ctx, config) {
     }
   }
 
-  // 总是探一次：状态接口要反映真实可用性。拉起与部署各自受 autoStart / provision 控制。
-  void ensureJudge()
+  // 本地判定服务只在 local 后端下才需要。jev 走公网端点，探活与部署都是白做：
+  // 以前的实现会在用 Jev 时照样去装 torch、下 850MB 权重，状态接口还长期报「部署失败」。
+  if (live().judgeSource === 'local') {
+    void ensureJudge()
+  } else {
+    trace(`判定后端是 jev（${live().jevUrl}），不检查本地判定服务`)
+  }
 
   // provider 拓扑变了（新加 provider、改模型定义），缓存的档位立刻作废。
   ctx.on('llm/adapters-updated', () => { infos.clear() })
 
-  ctx.on('agent/inbox/claimed', (payload) => {
-    const text = textOf(payload && payload.message)
+  /** 正在 hold 本轮的 agent。maintenance 期间 status 仍是 idle，靠这张表防重入。 */
+  const holds = new Set()
+
+  /**
+   * 唯一的写入时机：用户消息进 inbox 的那一刻。
+   *
+   * 0.2.2 的顺序是 `send()` 先 splice（同步 emit `agent/inbox/inserted`），再 wakeDriver；
+   * 唤醒起来后 turn → preStep 里先 `inbox.claim()`，紧接着 `model.current()` 快照。
+   * 也就是说写在 pre-step 里的强度最早也要下一步才生效。
+   *
+   * `inserted` 是快照之前唯一的异步窗口：监听器在第一个 await 之前调用
+   * `agent.runMaintenance()`，phase 立刻变成 maintenance，随后的 wakeDriver 只能记下
+   * wakeRequested。判定跑完、`model.select()` 写完，hold 结束才放开唤醒，第一个请求就用上新强度。
+   */
+  ctx.on('agent/inbox/inserted', ({ agent, message }) => {
+    if (agent === undefined || agent === null || agent.status !== 'idle') return
+    if (holds.has(agent)) return
+    if (isSubagent(agent)) return
+    if (message === null || message === undefined || message.source?.kind !== 'user') return
+    const text = textOf(message)
     if (text === '') return
-    tasks.set(sessionKey(payload), text)
+    const now = live()
+    if (!now.enabled || now.mode === 'manual') return
+
+    holds.add(agent)
+    let task
+    try {
+      task = agent.runMaintenance(async (signal) => {
+        const route = agent.model?.current?.()
+        if (route === undefined || route === null || !route.provider || !route.model) return
+        const key = sessionKeyOf(agent)
+        const tier = await askJudge(text, signal, now, now.judgeTimeoutMs)
+        if (signal.aborted === true) return
+        // 判定失败也要落一个档：hold 已经把本轮唤醒扣住，白扣一轮比落错一档更糟。
+        // 兜底顺序按设计：该会话上一轮的档位，没有就用配置里的 tiers.fallback。
+        const chosen = tier ?? recent.get(key)?.tier ?? now.tiers.fallback
+        if (tier === null) trace(`判定不可用，用 ${chosen} 档兜底（${key}）`)
+        const verdict = await routeEffort(agent, key, route, chosen, signal, now, undefined)
+        if (verdict === undefined) {
+          // 模型没声明强度、写入接口不可用、或者这一轮已被取消：这一轮到此为止。
+          // 记下「已经判过」，pre-step 别再问一次——那边问是要 await 在请求前面的。
+          remember(verdicts, key, { messageId: message.id, skipped: true })
+          return
+        }
+        // 记下消息 id：pre-step 只认这条消息认领的那一轮，别把陈年判定套到新任务上。
+        remember(verdicts, key, { messageId: message.id, ...verdict })
+      })
+    } catch {
+      // phase 已经被别的活动占住（运行中的 turn、别的插件的 maintenance）：放弃本轮。
+      holds.delete(agent)
+      return
+    }
+    void task
+      .finally(() => holds.delete(agent))
+      .catch((error) => trace(`hold: ${error && error.message ? error.message : error}`))
   }, { global: true })
 
-  ctx.on('agent/request', async (payload, next) => {
-    const base = await next()
-    const now = live()
-    if (!now.enabled || now.mode === 'manual') return base
-    if (!base || !base.provider || !base.model) return base
-    // 子代理的强度跟主代理走，这里不覆盖。
-    if (isSubagent(payload)) return base
-    try {
-      const key = sessionKey(payload)
-      const turn = payload && payload.turn
-      const cached = verdicts.get(key)
-      let tier
-      if (cached !== undefined && cached.turn === turn) {
-        tier = cached.tier
-      } else if (pending.has(key)) {
-        // pre-step 在 step 1 已经问过判定服务，这里直接复用。
-        tier = pending.get(key)
-        pending.delete(key)
-        verdicts.set(key, { turn, tier })
-      } else {
-        tier = await askJudge(tasks.get(key), payload && payload.signal, now)
-        verdicts.set(key, { turn, tier })
-      }
-      if (tier === null || tier === undefined) return base
-
-      const picked = pickForTier(await effortsFor(base.provider, base.model), tier, now.tiers)
-      if (picked === undefined) return base
-      // 兜底层：有 model-selection 的运行时会把这里写的值剥掉，真正生效的是 pre-step
-      // 写进会话选择的那份。没有 model-selection 的运行时靠这一层。
-
-      // 上一轮之后强度被改过，说明是用户自己拧的：这时只升不降。
-      const previous = written.get(key)
-      let effort = picked
-      if (previous !== undefined && previous.turn !== turn
-        && base.reasoningEffort !== undefined && base.reasoningEffort !== previous.effort) {
-        const pinned = strengthOf(base.reasoningEffort)
-        const want = strengthOf(picked)
-        if (pinned !== undefined && want !== undefined && want <= pinned) effort = base.reasoningEffort
-      }
-      written.set(key, { turn, effort })
-      recordVerdict(key, tier, effort, base.provider, base.model, turnOf(payload))
-      if (effort === base.reasoningEffort) return base
-      log(`turn ${turn} ${tier} => ${effort}（${base.provider}/${base.model}）`)
-      return { ...base, reasoningEffort: effort }
-    } catch (error) {
-      log(`本轮跳过（${error && error.message ? error.message : error}）`)
-      return base
-    }
-    // prepend：排在会话级监听之前，否则用户没显式选强度时，我们写的值会被抹掉。
-  }, { global: true, prepend: true })
-
   // 每轮第一步在对话里留一条可见提示：难度档位、最终强度、模型。
-  // 只在强度和上一轮不同、或 notify: always 时插入，避免每轮都刷屏。
+  // 强度与选择在 hold 阶段就写完了，这里只读结果；只有用户插话导致的补判才现问。
   ctx.on('agent/pre-step', async (payload, next) => {
     const decision = await next()
     const now = live()
     if (!now.enabled || now.mode === 'manual') return decision
     if (decision.kind === 'reject') return decision
-    if (payload.step !== 1) return decision
+    if (isSubagent(payload.agent)) return decision
     try {
-      const route = currentRoute(ctx, payload)
+      const route = currentRoute(payload)
       if (route === undefined) {
         // 拿不到本轮模型时插不了提示（提示里要写模型名）。留一行痕迹，免得像“没生效”。
-        trace('pre-step: 拿不到本轮模型，跳过')
+        trace('pre-step: payload 里没有本轮模型，跳过')
         return decision
       }
-      const key = sessionKey(payload)
-      const tier = await askJudge(tasks.get(key), payload.signal, now)
-      if (tier === null) return decision
-      pending.set(key, tier)
-      const effort = pickForTier(await effortsFor(route.provider, route.model), tier, now.tiers)
-      if (effort === undefined) return decision
-      // 先写会话选择：这一步决定请求里到底带不带强度，与要不要插提示无关。
-      applySelection(ctx, payload.agent, route.provider, route.model, effort)
-      recordVerdict(key, tier, effort, route.provider, route.model, turnOf(payload))
+      const key = sessionKeyOf(payload.agent)
+      const claimed = Array.isArray(payload.messages) ? payload.messages : []
+      const claimedIds = new Set(claimed.map((message) => message && message.id).filter((id) => id !== undefined))
+      let verdict = verdicts.get(key)
+      const fromHold = verdict !== undefined
+        && verdict.messageId !== undefined
+        && claimedIds.has(verdict.messageId)
+      if (!fromHold) {
+        // 这一轮没走到 hold（运行中插话、或者唤醒来自队列）：补判一次。
+        // selection 在派发 pre-step 之前就快照好了，这次写入从下一步生效。
+        // 用户消息优先：hold 只认用户消息，这里保持一致；step 1 若拿不到用户消息
+        // （定时任务、webhook 之类）再退回整批，更靠后的 step 只认用户插话。
+        const users = claimed.filter((message) => message && message.source && message.source.kind === 'user')
+        const candidate = users.length > 0 ? users : payload.step === 1 ? claimed : []
+        const text = textsOf(candidate)
+        if (text === '') return decision
+        const tier = await askJudge(text, payload.signal, now, now.judgeTimeoutMs)
+        if (tier === null) return decision
+        verdict = await routeEffort(payload.agent, key, route, tier, payload.signal, now, payload.turn)
+        if (verdict === undefined) return decision
+      } else if (verdict.skipped === true) {
+        // hold 已经判过，只是没什么可写（模型没有强度 / 写入接口不在）。
+        return decision
+      }
+      // 提示只在每轮第一步插；中途插话补判过的那几步不刷屏。
+      if (payload.step !== 1) return decision
       if (now.notify === 'off') return decision
-      if (now.notify !== 'always' && effort === route.reasoningEffort) return decision
-      trace(`pre-step: 插入提示 ${tier} -> ${effort}（${route.provider}/${route.model}）`)
-      return { ...decision, messages: [...decision.messages, notice(tier, effort, route.provider, route.model)] }
+      if (now.notify !== 'always' && verdict.effort === verdict.baseline) return decision
+      trace(`pre-step: 插入提示 ${verdict.tier} -> ${verdict.effort}（${route.provider}/${route.model}）`)
+      return {
+        ...decision,
+        messages: [...decision.messages, notice(verdict.tier, verdict.effort, route.provider, route.model)],
+      }
     } catch (error) {
       log(`判定失败（${error && error.message ? error.message : error}）`)
       return decision
@@ -1235,7 +1433,7 @@ export function apply(ctx, config) {
       trace('webServer 不可用，模式开关没注册')
       return
     }
-    trace('webServer 就绪，注册 /effort-router/mode 与 /effort-router/judge（含旧别名）')
+    trace('webServer 就绪，注册 9 组 /effort-router/* 路由（含 /router-effort/* 旧别名）')
     /**
      * 读 JSON 请求体。
      *
@@ -1374,11 +1572,14 @@ export function apply(ctx, config) {
         res.end()
         return
       }
+      const now = live()
+      const jev = now.judgeSource === 'jev'
       const text = JSON.stringify({
+        backend: now.judgeSource,
         state: judge.state,
         detail: judge.detail,
-        judgeUrl: live().judgeUrl,
-        setupLog: SETUP_LOG_PATH,
+        judgeUrl: jev ? now.jevUrl : now.judgeUrl,
+        ...(jev ? { jevModel: now.jevModel } : { setupLog: SETUP_LOG_PATH }),
       })
       res.statusCode = 200
       res.setHeader('Content-Type', 'application/json; charset=utf-8')
