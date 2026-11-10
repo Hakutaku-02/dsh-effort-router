@@ -6,7 +6,8 @@ on:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    # 测试用 taskkill 收进程树（测试里进程树断言依赖它），Ubuntu runner 上会红。
+    runs-on: windows-latest
     strategy:
       matrix:
         node: [20, 22, 24]
