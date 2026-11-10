@@ -17,6 +17,7 @@ import { randomUUID } from 'node:crypto'
 import { appendFileSync, closeSync, cpSync, existsSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import { homedir, tmpdir } from 'node:os'
+import { fileURLToPath } from 'node:url'
 import { join } from 'node:path'
 // profile 提供的 peer：包落在能解析到 harness 的 node_modules 下就能裸解析。
 import z from '@deepseek-ai/schemastery'
@@ -29,14 +30,21 @@ const JUDGE_TIMEOUT_MS = 20000
  * hold 阶段等判定的上限。
  *
  * 判定跑在 `runMaintenance` 里，本轮唤醒被扣住，第一个 token 要等判定结束才出来，
- * 等待时间就是判定耗时。所以这里的预算必须短：宁可这一轮落兜底档，也不要把用户晾着。
+ * 等待时间就是判定耗时。预算给这次等待划一条线：超了就落兜底档，请求照常发出。
  *
- * 两个后端分开给：本地判定服务在同机同进程旁，几十毫秒就回；Jev 是公网决策端点，
- * 实测单次 1 到 2 秒（含排队）。用同一个值，要么本地白等，要么 Jev 每轮都超时兜底。
+ * 两个后端分开给，按实测定（2026-11-10，846MB CPU 微调判定服务）：本地服务的单次判定
+ * 跟内容强相关，规则快路径 7 到 45ms，常见提问 p50 2.9 秒、p90 4.3 秒，120 到 180 字
+ * 要 5 到 7 秒，长文本撞 12 秒饱和线。6000ms 覆盖常见提问，更长的文本按兜底档放行。
+ * Jev 是公网决策端点，实测 1 到 2 秒，给 3000ms。
+ * 实测记录在 docs/20261110-local-restore/report.md。
  */
-const JUDGE_HOLD_TIMEOUT_MS = 1200
+const JUDGE_HOLD_TIMEOUT_MS = 6000
 /** Jev 的 hold 预算：覆盖公网往返与端点排队，仍留出「超时也要放行」的余地。 */
 const JEV_HOLD_TIMEOUT_MS = 3000
+/** 拉起判定服务失败后，隔多久再自动试一次。 */
+const JUDGE_START_RETRY_MS = 60000
+/** 部署（装 venv、下权重）失败后的冷却：那条路每次都重跑整个脚本，不该每分钟来一次。 */
+const JUDGE_DEPLOY_RETRY_MS = 30 * 60000
 /** 会话级内存表的容量上限。会话数是外部输入，不设上限这两张表会一直涨。 */
 const MAX_SESSION_ENTRIES = 200
 /**
@@ -138,6 +146,13 @@ export const Config = z.object({
   autoStart: z.boolean(),
   servicePython: z.string(),
   serviceScript: z.string(),
+  /**
+   * 判定服务的权重目录，拉起时作为 LAYA_MODEL 传给 laya_router.py。
+   *
+   * 权重目录写在别处（别的盘、镜像目录）时在这里指路。空着时服务去 <包目录>/weights/model
+   * 找权重，找不到就退成基座协议：/health 报 protocol=base，/judge 不带 tier，插件两头都用不了。
+   */
+  serviceModel: z.string(),
   provision: z.boolean(),
   layaDir: z.string(),
   startupWaitMs: z.number(),
@@ -448,10 +463,21 @@ function isSubagent(agent) {
   }
 }
 
-/** 拉起本机判定服务，返回一句结果说明。失败不影响路由。 */
-function startService(base, python, script) {
+/**
+ * 拉起本机判定服务，返回一句结果说明。失败不影响路由。
+ *
+ * 服务不直接挂在 DSH 下面，而是交给 supervisor.mjs 看管：那个脚本盯着 DSH 的 pid，DSH 一没了
+ * 就把 python 整棵进程树结束掉。Windows 不会因为父进程退出就杀子进程，不包这一层，DSH 关掉后
+ * 判定服务会一直占着端口和内存。
+ *
+ * `model` 有值时作为 LAYA_MODEL 传给服务，服务从那个目录读权重。权重不在包目录里
+ * （放在别的盘或镜像目录）时必须传，否则服务以基座协议启动，/judge 没有 tier。
+ */
+function startService(base, python, script, model) {
   if (!python || !script) return '未配置判定服务路径，跳过启动'
   if (!existsSync(python) || !existsSync(script)) return `判定服务文件缺失（${python} / ${script}），跳过启动`
+  const supervisor = fileURLToPath(new URL('./supervisor.mjs', import.meta.url))
+  if (!existsSync(supervisor)) return `缺少看门人脚本（${supervisor}），跳过启动`
   let fd
   try {
     fd = openSync(SERVICE_LOG_PATH, 'a')
@@ -459,19 +485,32 @@ function startService(base, python, script) {
     fd = undefined
   }
   try {
-    // pythonw 是窗口子系统，不会弹出黑色控制台。
-    let exe = python
-    const pythonw = python.replace(/python(\.exe)?$/i, 'pythonw.exe')
-    if (process.platform === 'win32' && existsSync(pythonw)) exe = pythonw
     const port = new URL(base).port || '8765'
-    const child = spawn(exe, [script, '--http', '--port', port], {
-      detached: true,
+    const child = spawn(process.execPath, [
+      supervisor,
+      '--python', python,
+      '--script', script,
+      '--port', port,
+      ...(typeof model === 'string' && model !== '' ? ['--model', model] : []),
+      '--parent', String(process.pid),
+    ], {
       windowsHide: true,
       stdio: ['ignore', 'ignore', fd === undefined ? 'ignore' : fd],
-      env: { ...process.env, PYTHONIOENCODING: 'utf-8' },
     })
+    // unref 让看门人进程不拖住 DSH 的事件循环；它的生死由父 pid 轮询决定，不靠这里的句柄。
     child.unref()
-    return `已拉起判定服务（${exe}）`
+    // 记下看门人 pid：下次启动时用它区分「我们拉起、有人看管」和「旧版遗留、没人看管」的服务。
+    try {
+      mkdirSync(provisionRoot(), { recursive: true })
+      writeFileSync(
+        join(provisionRoot(), 'service.pid'),
+        JSON.stringify({ supervisor: child.pid ?? null, parent: process.pid, at: Date.now() }) + '\n',
+      )
+    } catch {
+      /* 写不了就算了，只影响状态说明 */
+    }
+    const weights = typeof model === 'string' && model !== '' ? '，权重 ' + model : ''
+    return '已拉起判定服务（' + python + weights + '，pid ' + (child.pid ?? '?') + '，随 DSH 退出）'
   } catch (error) {
     return `拉起判定服务失败：${error && error.message ? error.message : error}`
   } finally {
@@ -499,6 +538,24 @@ function layaRoot(cfg) {
 /** 部署产物的落地目录。venv 和 846MB 权重都在这里，测试用 ROUTER_EFFORT_HOME 指到别处。 */
 function provisionRoot() {
   return process.env.ROUTER_EFFORT_HOME || join(homedir(), '.dsh', 'router-effort')
+}
+
+/**
+ * 上一次拉起的看门人还活着吗。
+ *
+ * 服务在线不代表它随 DSH 生死：旧版本直接 detached 拉起 python，没有看门人；用户也可能自己
+ * 起了一份。这里只回报事实，不去结束别人的进程。
+ */
+function supervisorAlive() {
+  try {
+    const recorded = JSON.parse(readFileSync(join(provisionRoot(), 'service.pid'), 'utf8'))
+    const pid = Number(recorded?.supervisor)
+    if (!Number.isInteger(pid) || pid <= 0) return false
+    process.kill(pid, 0)
+    return true
+  } catch {
+    return false
+  }
 }
 
 /** 最近判定落盘的位置。重启后芯片要能显示上一次的档位。 */
@@ -1259,6 +1316,10 @@ export function apply(ctx, config) {
    */
   async function askJudge(task, signal, now, timeoutMs) {
     if (now.judgeSource === 'jev') return askJev(task, signal, now, timeoutMs)
+    // 后端是热改的。判定前发现本地服务不在线就顺手拉起：设置页刚切到「本地」时，
+    // 挂载阶段的检查早过去了，不补这一下，服务要等下次重启 DSH 才起得来。
+    if (judge.state !== 'up') requestJudgeStart()
+    // 发全文：截断会改判定结果（实测同一段多段规格，全文判 low 用 45ms，截到 150 字判 max 用 6.9 秒）。
     return judgeTier(now.judgeUrl, task, signal, judge, timeoutMs)
   }
 
@@ -1328,13 +1389,15 @@ export function apply(ctx, config) {
     try {
       if (await waitForService(base, startupWaitMs)) {
         judge.state = 'up'
-        judge.detail = ''
-        log(`判定服务已在线（${base}）`)
+        // 服务在线，但未必归我们管：旧版本拉起的、或者用户手工起的，退出 DSH 之后不会自己消失。
+        const watched = supervisorAlive()
+        judge.detail = watched ? '' : '服务在线但不在看门人管下（旧版遗留或手工启动），退出 DSH 后它不会自己结束'
+        log(watched ? `判定服务已在线（${base}）` : judge.detail)
         return
       }
       if (cfg.autoStart !== false && cfg.servicePython && cfg.serviceScript) {
         judge.state = 'starting'
-        log(startService(base, cfg.servicePython, cfg.serviceScript))
+        log(startService(base, cfg.servicePython, cfg.serviceScript, cfg.serviceModel))
         if (await waitForService(base, startWaitMs)) {
           judge.state = 'up'
           judge.detail = ''
@@ -1379,10 +1442,29 @@ export function apply(ctx, config) {
     }
   }
 
+  /**
+   * 拉起判定服务的单飞入口。
+   *
+   * 挂载时调一次，之后由 askJudge 在「本地后端 + 状态不是 up」时再调。冷启动要加载权重，
+   * 一次运行占住几十秒，所以同一时刻只跑一次。失败后按 cooldown 再试，部署失败
+   * （脚本报错、缺包）给更长的冷却，因为那条路每次都重跑整个部署脚本。
+   */
+  const judgeStart = { at: 0, running: false }
+  function requestJudgeStart() {
+    if (judgeStart.running) return
+    const cooldown = judge.state === 'failed' || judge.state === 'missing'
+      ? JUDGE_DEPLOY_RETRY_MS
+      : JUDGE_START_RETRY_MS
+    if (Date.now() - judgeStart.at < cooldown) return
+    judgeStart.at = Date.now()
+    judgeStart.running = true
+    void ensureJudge().finally(() => { judgeStart.running = false })
+  }
+
   // 本地判定服务只在 local 后端下才需要。jev 走公网端点，探活与部署都是白做：
   // 以前的实现会在用 Jev 时照样去装 torch、下 850MB 权重，状态接口还长期报「部署失败」。
   if (live().judgeSource === 'local') {
-    void ensureJudge()
+    requestJudgeStart()
   } else {
     trace(`判定后端是 jev（${live().jevUrl}），不检查本地判定服务`)
   }

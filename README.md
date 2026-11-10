@@ -3,7 +3,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-0.4.1-3B82F6?style=flat-square" alt="version">
+  <img src="https://img.shields.io/badge/version-0.4.2-3B82F6?style=flat-square" alt="version">
   <img src="https://img.shields.io/badge/license-MIT-12B981?style=flat-square" alt="license">
   <img src="https://img.shields.io/badge/node-%3E%3D18-8B5CF6?style=flat-square" alt="node">
   <img src="https://img.shields.io/badge/dsh-%3E%3D0.2.2--rc.1-0EA5E9?style=flat-square" alt="dsh">
@@ -33,7 +33,7 @@
 - 每轮判一次，判的是这一轮的用户消息。
 - `provider` 和 `model` 用模型选择器里的那个，换厂商不用改插件。
 - 档位按模型声明的强度列表按位置落位，各厂商的档位都能用满。
-- 判定源可选：本机 Python 判定服务，或 Jev 的 System One 决策端点。
+- 判定源可选：本机 Python 判定服务，或 Jev 的 System One 决策端点。选本机时插件自己拉起服务，在设置页切过来也不用重启。
 - 输入框右侧的芯片显示上一轮与这一轮的档位，悬停能看到最终强度与模型名。
 - 判定结果落盘到 `~/.dsh/router-effort/last.json`，重启 DSH 后芯片仍有内容。
 - 你在模型选择器里手动调过强度时，判定结果只往上抬，比你的选择弱就保留你的选择。
@@ -45,7 +45,10 @@
 flowchart TD
   A["用户消息进 inbox"] --> B["agent/inbox/inserted：扣住本轮唤醒"]
   B --> C{"judgeSource"}
-  C -->|local| D["本机判定服务"]
+  C -->|local| L{"服务在线？"}
+  L -->|否| M["按 servicePython/Script/Model 拉起，冷启动约 60 秒"]
+  L -->|是| D["本机判定服务（发全文，2 到 13 秒）"]
+  M -.->|这一轮| G
   C -->|jev| E["Jev 决策端点"]
   D --> F["档位 low / high / max"]
   E --> F
@@ -68,14 +71,27 @@ send() → splice → agent/inbox/inserted（同步）→ runMaintenance 扣住�
 
 ## 首 token 延迟
 
-判定跑在 hold 里，这段等待直接落在本轮首 token 上。Jev 端点的实测（4000 字符任务文本、真实 criteria，20 次成功样本）：
+判定跑在 hold 里，这段等待直接落在本轮首 token 上。
+
+Jev 端点（4000 字符任务文本、真实 criteria，20 次成功样本）：
 
 | 口径 | p50 | p90 | max |
 | --- | --- | --- | --- |
 | 真实请求体（20 次） | 964ms | 1371ms | 1737ms |
 | 全部成功样本（50 次） | 964ms | 1591ms | 2416ms |
 
-50 个样本里没有超过 3000ms 的，所以 Jev 分支的判定预算默认 3000ms；本机判定服务在同机旁，默认 1200ms。两者都可以用 `judgeTimeoutMs` 改。
+本机判定服务（846MB CPU 微调模型，2026-11-10 实测）：
+
+| 输入 | 耗时 |
+| --- | --- |
+| 规则快路径（多段落规格、日志粘贴这类） | 7 到 45ms |
+| 常见提问（36 到 87 字） | p50 2.9 秒，p90 4.3 秒 |
+| 120 到 180 字 | 5 到 7 秒 |
+| 400 字以上 | 12 到 13 秒（饱和线） |
+
+所以预算按后端分：Jev 3000ms，本地 6000ms，两者都能用 `judgeTimeoutMs` 改。6000ms 覆盖常见提问；更长的文本落兜底档，这一轮多等的就是预算那么多。本地服务冷启动还要单独加载一次权重，约 60 秒，这段时间那几个请求照常发出、落兜底档。
+
+判定输入两个后端都发全文（最多 4000 字）。截断会改判定结果：同一段多段落规格，全文判 `low` 用 45ms，截到前 150 字判 `max` 用 6.9 秒。
 
 超出预算时按兜底档放行，这一轮多等的就是预算那么多。
 
@@ -103,11 +119,44 @@ dsh plugin --profile web install github:Hakutaku-02/dsh-effort-router
 
 ### 判定服务
 
-`judgeSource` 为 `local` 时，首次启动发现判定服务不在线，插件会在后台部署：建 venv、装 CPU 版 torch、下载 846 MB 权重、拉起服务。需要 Python 3.10 到 3.13，磁盘约 2 GB，能访问 PyPI 与 HuggingFace。冷启动加载权重约 70 秒。
+`judgeSource` 为 `local` 时才需要本机判定服务。三条配置把服务交给插件管：
 
-部署期间请求照常发出，那几轮落兜底档。装好之后状态会自己回到 `up`，不用重启。
+| 字段 | 填什么 |
+| --- | --- |
+| `servicePython` | 装好 torch 的解释器，例如 `E:\AIPack\DSH-laya\venv\Scripts\python.exe` |
+| `serviceScript` | `laya_router.py` 的路径，例如 `<包目录>/service/laya_router.py`，或用镜像目录 `~/.dsh/router-effort/laya/service/laya_router.py` |
+| `serviceModel` | 权重目录，拉起时作为 `LAYA_MODEL` 传给服务 |
 
-不想自动下载就把 `provision` 设为 `false`；下载慢可以设 `HF_ENDPOINT` 换镜像。
+三个都填对，插件在启动时（`judgeSource` 已经是 `local`）或用户切到「本地」后的第一条消息里，把服务拉起来：
+
+```bash
+python <laya_router.py> --http --port 8765     # 环境变量 LAYA_MODEL=<serviceModel>
+```
+
+> `serviceModel` 指到权重目录。空着时服务去 `<包目录>/weights/model` 找权重，找不到就退成基座协议：`/health` 报 `protocol=base`，`/judge` 不带 `tier`，插件两头都用不了。
+
+服务拉起后约 60 秒完成权重加载，状态从 `starting` 转 `up`。这期间请求照常发出，落兜底档。
+
+判定服务不直接挂在 DSH 下面，而是由 `supervisor.mjs` 看管：它每秒看一次 DSH 的 pid，DSH 退出或被强行结束后，用 `taskkill /T` 把 python 整棵进程树结束掉，然后自己退出。所以关掉 DSH，端口 8765 和那份权重占的内存会一起放掉，不需要手工清理。
+
+早于 0.4.3 的版本拉起的判定服务没人在看管，升级后它会一直占着端口（探活能通，插件就不会重复拉起）。升级那一次手工结束它：
+
+```bash
+netstat -ano | findstr :8765     # 记下 PID
+taskkill /PID <PID> /T /F
+```
+
+再重启 DSH，新的服务就归 `supervisor.mjs` 管了。
+
+想自己先把 venv 和权重备好（老部署、或者挪到别的盘）：
+
+```bash
+python -m venv .venv-router
+.venv-router/Scripts/python -m pip install -r service/requirements.lock.txt   # CPU 版 torch
+node weights/fetch.mjs                                                        # 846MB 权重到 weights/model
+```
+
+`provision` 为 `true` 时，服务起不来会退到 `dsh-router-laya` 自带的 `bin/setup.mjs` 做首次部署（建 venv、装 CPU 版 torch、下 846MB 权重）。这条路径目前有上游 bug：`setup.mjs` 建 venv 时读 `probe.base` 会抛 `TypeError: probe.base is not iterable`，日志在 `%TEMP%\router-effort-setup.log`。这条路不通时，按上面的手工步骤备好 venv 与权重，再把三条路径字段填上。
 
 `judgeSource` 为 `jev` 时不检查本机服务，也不部署。
 
@@ -175,7 +224,7 @@ local 判定在本机完成，任务描述不出本机；jev 会把任务描述�
 | `mode` | `auto` | `manual` 时不改请求，与总开关叠加 |
 | `judgeSource` | `local` | 判定后端，`local` 或 `jev` |
 | `judgeUrl` | `http://127.0.0.1:8765/judge` | 本机判定服务地址 |
-| `judgeTimeoutMs` | local `1200` / jev `3000` | 一次判定的预算，也是首 token 最多晚多久 |
+| `judgeTimeoutMs` | local `6000` / jev `3000` | 一次判定的预算，也是首 token 最多晚多久 |
 | `jevUrl` | `https://api.typesafe.ai/v1/systemone` | Jev 决策端点 |
 | `jevModel` | `jev-latest` | Jev 模型名 |
 | `jevApiKeyEnv` | `TYPESAFE_API_KEY` | 凭据引用名，面板保存 Key 时也写这里 |
@@ -187,6 +236,7 @@ local 判定在本机完成，任务描述不出本机；jev 会把任务描述�
 | `autoStart` | `true` | 发现本机判定服务不在线时按路径拉起 |
 | `servicePython` | 空 | 判定服务的 Python 路径 |
 | `serviceScript` | 空 | 判定服务的入口脚本 |
+| `serviceModel` | 空 | 权重目录，拉起时作为 `LAYA_MODEL` 传给服务 |
 | `provision` | `true` | 本机判定服务起不来时自动部署 |
 | `layaDir` | 空 | `dsh-router-laya` 包的位置 |
 | `startupWaitMs` | `3000` | 启动时等本机判定服务就绪的上限 |
@@ -195,6 +245,8 @@ local 判定在本机完成，任务描述不出本机；jev 会把任务描述�
 | `modelInfoTtlMs` | `60000` | 模型档位的缓存寿命 |
 
 保存写回 profile 的 `cordis.patch.yml`。`enabled`、`mode`、`judgeSource`、`judgeUrl`、`notify`、`tiers`、`jevUrl`、`jevModel`、`jevApiKeyEnv`、`jevConfidence`、`judgeTimeoutMs`、`legacyOwned` 改完即时生效，其余字段下次重启生效。
+
+`servicePython`、`serviceScript`、`serviceModel` 写在 profile 的 `cordis.patch.yml` 里，设置页没有对应输入框，改完下次重启 DSH 生效。切换 `judgeSource` 不用重启：切到「本地」后的第一条消息就会把服务拉起来。
 
 </details>
 
@@ -229,10 +281,16 @@ curl "http://127.0.0.1:<GUI 端口>/effort-router/judge"
 ## 已知限制
 
 - 判定服务（local）的请求与响应格式写死，换别的判定服务要改代码。
+- 本地判定对长文本更慢：400 字以上 12 到 13 秒，超出 6000ms 预算就落兜底档。
+- 本地判定的档位跟内容强相关，同一段文字截短会从 `low` 跳到 `max`，所以插件发全文。
+- 本地判定在 CPU 上是秒级：p50 2.5 秒，首 token 就晚这么多。要更快的判定就用 Jev 后端。
+- `provision` 走的上游 `setup.mjs` 会在建 venv 时抛 `TypeError: probe.base is not iterable`，自动部署这条路暂时不通，按「判定服务」一节手工备好 venv 与权重再用三个路径字段接管。
+- 服务被别处占着端口时，插件拉起的那个会在 `bind()` 里失败退出，状态仍会显示 `up`（占着端口那个能答话）。
+- 判定服务的生死跟着 DSH 走。想让它离开 DSH 继续跑（比如几个实例共用一份判定服务），就得自己起服务并把 `autoStart` 设为 `false`。
 - 强度排序按名字：`off` < `minimal` < `low` < `medium` < `high` < `xhigh` < `max`。厂商出现新词时要补进代码，否则那个强度会被跳过。
 - 一轮只判一次，中途追加的长任务不会重新判。
 - 子代理不单独判定，强度跟主代理走。
-- 判定在请求前跑完，首 token 会晚一次判定的时间：Jev 通常 1 秒上下，预算是 3000ms。
+- 判定在请求前跑完，首 token 会晚一次判定的时间：Jev 通常 1 秒上下（预算 3000ms），本地服务 2 到 7 秒（预算 6000ms）。
 - 模型选择器里的「推理等级」会跟着判定跳，这份选择就是请求的来源。你手动改过的等级作为下限，插件只往上取，不会降到它下面。
 - 每轮判定都会 append 一条 `model/selection`，值不变时宿主会短路，实际增量很小。
 - `last.json` 的记录从 0.4.1 起是 `schemaVersion: 2`。更早的记录在加载时迁移：缺 `baseline` 的按「插件自己写的」处理，由 `legacyOwned` 控制。
@@ -242,7 +300,7 @@ curl "http://127.0.0.1:<GUI 端口>/effort-router/judge"
 ## 开发
 
 ```bash
-npm test            # 10 个测试文件，不联网
+npm test            # 13 个测试文件，不联网
 npm run test:cordis # 在真 cordis 上下文里跑挂载与事件
 ```
 
