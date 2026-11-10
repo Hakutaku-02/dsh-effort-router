@@ -67,6 +67,14 @@ const JUDGE_TIERS = ['low', 'high', 'max']
 const DEFAULT_TIERS = { low: 'low', high: 'high', max: 'max', fallback: 'low' }
 /** 最近判定的保留条数。落盘和芯片列表都用它。 */
 const MAX_RECENT = 100
+/**
+ * 落盘记录的格式版本。
+ *
+ * 2 起记录带 picked / baseline / floor：判定落位值、写之前的强度、被下限挡住时挡住的值。
+ * 有了这三个字段，「这个强度是谁写的」就不再靠猜。版本 1 的记录（0.4.0 之前的插件写的）
+ * 只有 tier 与 effort，加载时按 migrateRecord 的规则迁移。
+ */
+const RECORD_SCHEMA_VERSION = 2
 /** 档位没变化时，最多这么久也刷一次盘。 */
 const SAVE_INTERVAL_MS = 60000
 /** 查询参数的长度上限。端点名与模型名都很短，超长的一律当非法。 */
@@ -118,6 +126,13 @@ export const Config = z.object({
    * 就永远轮不到（以前本地 1200 会盖掉 Jev 的 3000）。留空由 live() 按后端决定。
    */
   judgeTimeoutMs: z.number().volatile(),
+  /**
+   * 旧记录缺归属标记时的口径。
+   *
+   * true：按「插件自己写的」处理（旧版每轮都写会话选择，记录里的强度就是它写的）。
+   * false：按「用户手动设的下限」处理，回到 0.4.0 的保守行为。
+   */
+  legacyOwned: z.boolean().default(true).volatile(),
   notify: z.string().default('').volatile(),
   tiers: z.dict(z.string()).volatile(),
   autoStart: z.boolean(),
@@ -500,8 +515,34 @@ function bareSession(value) {
   return String(value ?? '').replace(/^session-/, '')
 }
 
-/** 读回上次落盘的判定。文件不存在、坏掉、结构不对都当空表；只留最新的 limit 条。 */
-function loadRecent(limit) {
+/**
+ * 把一条历史记录迁到当前格式。
+ *
+ * 版本 1 的记录（0.4.0 之前的插件写的）没有 owned，也没有 baseline。那一版每轮都会把强度
+ * 写进会话选择，记录里的 effort 就是它写的值，所以缺 baseline 的记录按「插件自己写的」处理。
+ * 新版早期也写出过没有 baseline 的 owned: false，同样缺证据，走同一条规则。
+ *
+ * legacyOwned 为 false 时回到保守口径：拿不准的一律当用户手动设的下限。
+ */
+export function migrateRecord(record, legacyOwned) {
+  if (record === null || typeof record !== 'object') return record
+  if (Number(record.schemaVersion) >= RECORD_SCHEMA_VERSION) return record
+  const provable = typeof record.baseline === 'string'
+  return {
+    ...record,
+    schemaVersion: RECORD_SCHEMA_VERSION,
+    // 当年的判定落位值已经不可考，只能按记录里最终写下的强度补。
+    picked: typeof record.picked === 'string' ? record.picked : record.effort,
+    baseline: provable ? record.baseline : record.effort,
+    owned: provable ? record.owned === true : legacyOwned !== false,
+  }
+}
+
+/**
+ * 读回上次落盘的判定。文件不存在、坏掉、结构不对都当空表；只留最新的 limit 条。
+ * 读进来的记录顺手迁移到当前格式，旧数据不会因为缺字段被当成用户下限。
+ */
+function loadRecent(limit, legacyOwned) {
   try {
     const parsed = JSON.parse(readFileSync(recentPath(), 'utf8'))
     const rows = parsed !== null && typeof parsed === 'object' && parsed.records !== null && typeof parsed.records === 'object'
@@ -509,6 +550,7 @@ function loadRecent(limit) {
       : {}
     return new Map(Object.entries(rows)
       .filter((entry) => entry[1] !== null && typeof entry[1] === 'object')
+      .map(([key, value]) => [key, migrateRecord(value, legacyOwned)])
       .sort((left, right) => (Number(right[1]?.at) || 0) - (Number(left[1]?.at) || 0))
       .slice(0, limit))
   } catch {
@@ -526,7 +568,7 @@ function loadRecent(limit) {
  *    降低「读—改—写」窗口里丢掉对方新行的概率；两次都没抢到就放弃，下次判定再写。
  * 写失败不影响路由。
  */
-function saveRecent(recent, limit) {
+function saveRecent(recent, limit, legacyOwned) {
   const target = recentPath()
   const temporary = `${target}.${process.pid}.${Math.random().toString(36).slice(2, 8)}.tmp`
   const mtimeOf = () => {
@@ -540,7 +582,7 @@ function saveRecent(recent, limit) {
     mkdirSync(provisionRoot(), { recursive: true })
     for (let attempt = 0; attempt < 2; attempt += 1) {
       const before = mtimeOf()
-      const merged = loadRecent(limit)
+      const merged = loadRecent(limit, legacyOwned)
       for (const [key, value] of recent) {
         const existing = merged.get(key)
         if (existing === undefined || (Number(value?.at) || 0) >= (Number(existing?.at) || 0)) {
@@ -550,7 +592,7 @@ function saveRecent(recent, limit) {
       const rows = [...merged.entries()]
         .sort((left, right) => (Number(right[1]?.at) || 0) - (Number(left[1]?.at) || 0))
         .slice(0, limit)
-      writeFileSync(temporary, `${JSON.stringify({ version: 1, records: Object.fromEntries(rows) }, null, 2)}\n`)
+      writeFileSync(temporary, `${JSON.stringify({ version: RECORD_SCHEMA_VERSION, records: Object.fromEntries(rows) }, null, 2)}\n`)
       if (mtimeOf() === before) {
         renameSync(temporary, target)
         return
@@ -670,6 +712,7 @@ export function apply(ctx, config) {
       jevTimeoutMs: toMs(values?.jevTimeoutMs ?? cfg.jevTimeoutMs, JEV_TIMEOUT_MS),
       // 没配预算时按后端给默认值：Jev 是公网往返，本地服务是同机调用。
       judgeTimeoutMs: toMs(values?.judgeTimeoutMs ?? cfg.judgeTimeoutMs, judgeSource === 'jev' ? JEV_HOLD_TIMEOUT_MS : JUDGE_HOLD_TIMEOUT_MS),
+      legacyOwned: typeof values?.legacyOwned === 'boolean' ? values.legacyOwned : valueOf(cfg.legacyOwned, true) !== false,
     }
   }
 
@@ -696,7 +739,7 @@ export function apply(ctx, config) {
   /** provider/model -> { at, list }，档位解析结果，带寿命。 */
   const infos = new Map()
   /** 会话 -> 最近一次判定，供输入框旁的芯片显示。启动时从磁盘读回，重启后芯片不会空。 */
-  const recent = loadRecent(MAX_RECENT)
+  const recent = loadRecent(MAX_RECENT, live().legacyOwned)
   /** 浏览器半边最后一次报到的时间、它带上来的会话参数，以及组件收到的 props 键名。 */
   const clientSeen = { at: 0, lastQuery: null, keys: null, sid: null }
 
@@ -727,17 +770,23 @@ export function apply(ctx, config) {
    * 落盘条件：档位或归属变了，或者距上次落盘超过 SAVE_INTERVAL_MS。后者保证活跃会话在
    * 磁盘上不会变成「最久没更新」而被容量淘汰挤掉。
    */
-  function recordVerdict({ key, tier, effort, provider, model, turn, owned }) {
+  function recordVerdict({ key, tier, picked, baseline, floor, effort, provider, model, turn, owned, legacyOwned }) {
     const previous = recent.get(key)
     const now = Date.now()
     const changed = previous === undefined
       || previous.tier !== tier
       || previous.effort !== effort
+      || previous.picked !== picked
+      || previous.baseline !== baseline
       || previous.provider !== provider
       || previous.model !== model
       || previous.owned !== (owned === true)
     recent.set(key, {
+      schemaVersion: RECORD_SCHEMA_VERSION,
       tier,
+      // 判定落位值与写之前的强度一起记：下次判断归属时不必再猜当时发生了什么。
+      picked,
+      baseline,
       effort,
       provider,
       model,
@@ -745,6 +794,8 @@ export function apply(ctx, config) {
       prevTier: previous === undefined ? null : previous.tier,
       turn,
       owned: owned === true,
+      // 被下限挡住时记下挡住的值；其余情况不写这个字段。
+      ...(floor === undefined ? {} : { floor }),
     })
 
     // 内存也要裁：只在读盘时截断会让这张表随着会话数一直涨。
@@ -757,7 +808,7 @@ export function apply(ctx, config) {
     // 后者让「档位一直不变但会话很活跃」的记录在磁盘上不会变成最旧的那条。
     if (changed || now - saveState.at > SAVE_INTERVAL_MS) {
       saveState.at = now
-      saveRecent(recent, MAX_RECENT)
+      saveRecent(recent, MAX_RECENT, legacyOwned)
     }
   }
 
@@ -944,6 +995,9 @@ export function apply(ctx, config) {
       if (saved.effort !== currentEffort) return false
       // 值没变，而且这条确实是我们写的：可以继续接管。
       if (saved.owned === true) return true
+      // 记录说不是我们写的（当年被下限挡住）。判定想要更高的档时由 routeEffort 接手，
+      // 这里不认领，免得把用户的下限抹掉。
+      return false
     }
     // 没有可认领的历史（或者历史就是当前值但不是我们写的）：等于 agent 默认强度时接管，
     // 否则当作会话里原有的用户选择。
@@ -986,11 +1040,28 @@ export function apply(ctx, config) {
     const ours = ownsSelection(agent, key, baseline)
     const effort = ours ? picked : onlyRaise(baseline, picked)
     if (!applySelection(agent, route.provider, route.model, effort)) return undefined
-    // 只在我们真的改过值、或者这个值本来就是我们的时才认领：把用户自己拧的值原样写回去
-    // 不算我们的，否则下一轮就分不清那是用户的下限还是我们写的。
-    const owned = ours || effort !== baseline
+    // 三种情形分开记，归属才算得清楚：
+    // - 我们本来就有这个值，或者这一轮改了值：归我们；
+    // - 判定本来就要当前这个强度（picked === baseline）：插件认可它，也算我们的，
+    //   下一次判定更低时才有资格降下来；
+    // - 判定要改、被下限挡住（picked ≠ baseline 而 effort 仍是 baseline）：会话里那个值是
+    //   用户的下限，把挡住的值记进 floor，下一次判定要提到它之上才动得了。
+    const blocked = picked !== undefined && picked !== null && picked !== baseline && effort === baseline
+    const owned = ours || effort !== baseline || picked === baseline
     if (owned) remember(written, key, { effort })
-    recordVerdict({ key, tier, effort, provider: route.provider, model: route.model, turn, owned })
+    recordVerdict({
+      key,
+      tier,
+      picked,
+      baseline,
+      floor: blocked ? baseline : undefined,
+      effort,
+      provider: route.provider,
+      model: route.model,
+      turn,
+      owned,
+      legacyOwned: now.legacyOwned,
+    })
     return { tier, effort, baseline }
   }
 
@@ -1498,6 +1569,7 @@ export function apply(ctx, config) {
         }
         clean.judgeUrl = parsed.toString()
       }
+      if (typeof patch.legacyOwned === 'boolean') clean.legacyOwned = patch.legacyOwned
       if (patch.notify === '' || patch.notify === 'off' || patch.notify === 'always') clean.notify = patch.notify
       if (typeof patch.jevUrl === 'string' && patch.jevUrl !== '') {
         let parsed

@@ -142,10 +142,12 @@ const diskRecords = () => JSON.parse(readFileSync(join(home, 'last.json'), 'utf8
   check('匹配: 没有的会话给 null', missing.current, null)
 }
 
-// 值没变就不重写：同一会话连续两轮判定相同，落盘的 at 保持第一次的时间
+// 值没变就不重写：前两轮里 baseline 会从 agent 默认值变成会话里的值，属于真的变化；
+// 从第三轮起记录完全一致，落盘的 at 就该冻住。
 {
   const ctx = fresh()
   const agent = agentOf('session-dedupe')
+  await holdOf(ctx, agent)
   await holdOf(ctx, agent)
   const first = diskRow('session-dedupe').at
   await holdOf(ctx, agent)

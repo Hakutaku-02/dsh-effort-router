@@ -1,6 +1,6 @@
 {
   "name": "dsh-effort-router",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "description": "按任务难度调整当前模型的思考强度，provider 与 model 保持用户所选",
   "type": "module",
   "main": "index.js",
@@ -38,7 +38,7 @@
     "dsh-router-laya": "^2.2.1"
   },
   "scripts": {
-    "test": "node test/effort.test.mjs && node test/apply.test.mjs && node test/mirror.test.mjs && node test/provision.test.mjs && node test/health.test.mjs && node test/config.test.mjs && node test/cache.test.mjs && node test/persist.test.mjs && node test/jev.test.mjs && node test/key.test.mjs && node test/client.test.mjs",
+    "test": "node test/effort.test.mjs && node test/apply.test.mjs && node test/mirror.test.mjs && node test/provision.test.mjs && node test/health.test.mjs && node test/config.test.mjs && node test/cache.test.mjs && node test/persist.test.mjs && node test/jev.test.mjs && node test/key.test.mjs && node test/client.test.mjs && node test/legacy.test.mjs",
     "test:cordis": "node test/cordis.test.mjs",
     "prepublishOnly": "npm test"
   },

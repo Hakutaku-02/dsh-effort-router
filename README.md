@@ -3,7 +3,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-0.4.0-3B82F6?style=flat-square" alt="version">
+  <img src="https://img.shields.io/badge/version-0.4.1-3B82F6?style=flat-square" alt="version">
   <img src="https://img.shields.io/badge/license-MIT-12B981?style=flat-square" alt="license">
   <img src="https://img.shields.io/badge/node-%3E%3D18-8B5CF6?style=flat-square" alt="node">
   <img src="https://img.shields.io/badge/dsh-%3E%3D0.2.2--rc.1-0EA5E9?style=flat-square" alt="dsh">
@@ -37,6 +37,7 @@
 - 输入框右侧的芯片显示上一轮与这一轮的档位，悬停能看到最终强度与模型名。
 - 判定结果落盘到 `~/.dsh/router-effort/last.json`，重启 DSH 后芯片仍有内容。
 - 你在模型选择器里手动调过强度时，判定结果只往上抬，比你的选择弱就保留你的选择。
+- 落盘记录里带着写之前的强度与判定落位值，升级后老会话不会被继承的强度永久卡住。
 
 ## 工作流程
 
@@ -182,6 +183,7 @@ local 判定在本机完成，任务描述不出本机；jev 会把任务描述�
 | `jevTimeoutMs` | `12000` | 设置页「测试」按钮的 Jev 请求超时 |
 | `tiers` | `low/high/max` 同名映射，`fallback: low` | 档位到强度的映射 |
 | `notify` | `''`（变化时提示） | 提示频率 |
+| `legacyOwned` | `true` | 旧记录缺归属标记时的口径：`true` 按插件自己写的算，`false` 按用户手动设的下限算 |
 | `autoStart` | `true` | 发现本机判定服务不在线时按路径拉起 |
 | `servicePython` | 空 | 判定服务的 Python 路径 |
 | `serviceScript` | 空 | 判定服务的入口脚本 |
@@ -192,7 +194,7 @@ local 判定在本机完成，任务描述不出本机；jev 会把任务描述�
 | `provisionWaitMs` | `5000` | 部署脚本跑完后等就绪的上限 |
 | `modelInfoTtlMs` | `60000` | 模型档位的缓存寿命 |
 
-保存写回 profile 的 `cordis.patch.yml`。`enabled`、`mode`、`judgeSource`、`judgeUrl`、`notify`、`tiers`、`jevUrl`、`jevModel`、`jevApiKeyEnv`、`jevConfidence`、`judgeTimeoutMs` 改完即时生效，其余字段下次重启生效。
+保存写回 profile 的 `cordis.patch.yml`。`enabled`、`mode`、`judgeSource`、`judgeUrl`、`notify`、`tiers`、`jevUrl`、`jevModel`、`jevApiKeyEnv`、`jevConfidence`、`judgeTimeoutMs`、`legacyOwned` 改完即时生效，其余字段下次重启生效。
 
 </details>
 
@@ -233,6 +235,7 @@ curl "http://127.0.0.1:<GUI 端口>/effort-router/judge"
 - 判定在请求前跑完，首 token 会晚一次判定的时间：Jev 通常 1 秒上下，预算是 3000ms。
 - 模型选择器里的「推理等级」会跟着判定跳，这份选择就是请求的来源。你手动改过的等级作为下限，插件只往上取，不会降到它下面。
 - 每轮判定都会 append 一条 `model/selection`，值不变时宿主会短路，实际增量很小。
+- `last.json` 的记录从 0.4.1 起是 `schemaVersion: 2`。更早的记录在加载时迁移：缺 `baseline` 的按「插件自己写的」处理，由 `legacyOwned` 控制。
 - 目前只在 Windows 上验证过。
 - 改了 `client.js` 要刷新窗口才看得到，宿主侧改动要重启 DSH。
 
