@@ -19,7 +19,6 @@ package-lock.json
 
 # API与Key
 .env/
-coverage/tmp/*
 
 # Bug文档
 docs/
