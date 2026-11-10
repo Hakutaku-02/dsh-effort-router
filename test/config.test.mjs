@@ -240,6 +240,16 @@ function preStep(ctx, agent, messages = []) {
   check('开关: 回读为开', opened.body.config.enabled, true)
 }
 {
+  // 芯片：/last 带上开关状态，关掉时前端据此整块不渲染
+  const { ctx } = fresh({ settings: defaultSettings() })
+  const on = await callRoute(ctx, '/effort-router/last', undefined, { method: 'GET', headers: {} })
+  check('芯片: 开着时 enabled 为 true', on.body.enabled, true)
+  await callRoute(ctx, '/effort-router/config', { enabled: false })
+  const off = await callRoute(ctx, '/effort-router/last', undefined, { method: 'GET', headers: {} })
+  check('芯片: 关掉时 enabled 为 false', off.body.enabled, false)
+  await callRoute(ctx, '/effort-router/config', { enabled: true })
+}
+{
   // 同一条会话：关着时强度原样，打开后下一次 hold 就写进去了
   const { ctx } = fresh({ settings: defaultSettings() })
   await callRoute(ctx, '/effort-router/config', { enabled: false })

@@ -38,7 +38,7 @@
     "dsh-router-laya": "^2.2.1"
   },
   "scripts": {
-    "test": "node test/effort.test.mjs && node test/apply.test.mjs && node test/mirror.test.mjs && node test/provision.test.mjs && node test/health.test.mjs && node test/config.test.mjs && node test/cache.test.mjs && node test/persist.test.mjs && node test/jev.test.mjs && node test/key.test.mjs",
+    "test": "node test/effort.test.mjs && node test/apply.test.mjs && node test/mirror.test.mjs && node test/provision.test.mjs && node test/health.test.mjs && node test/config.test.mjs && node test/cache.test.mjs && node test/persist.test.mjs && node test/jev.test.mjs && node test/key.test.mjs && node test/client.test.mjs",
     "test:cordis": "node test/cordis.test.mjs",
     "prepublishOnly": "npm test"
   },

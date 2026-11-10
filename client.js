@@ -509,14 +509,38 @@ window.__ModuleLoader__.load({
     }
 
     /**
+     * 芯片该显示什么。参数是 /effort-router/last 的响应。
+     *
+     * 路由开关关掉时返回 null：那一轮请求完全没被插件碰过，再摆一个档位出来会让人以为
+     * 判定还在跑。没有判定记录时给 Default 占位，位置不跳。
+     */
+    function chipView(body) {
+      if (body !== null && typeof body === 'object' && body.enabled === false) return null
+      const records = body !== null && typeof body === 'object' && Array.isArray(body.records) ? body.records : []
+      const current = body !== null && typeof body === 'object' && body.current !== null && body.current !== undefined
+        ? body.current
+        : null
+      // 本会话没有记录时退到最近一条：多会话串一下比空着好查。
+      const row = current !== null ? current : (records.length > 0 ? records[0] : null)
+      if (row === null || row === undefined) return { label: 'Default', detail: '暂无判定' }
+      // 三种「没有档位」都显示 Default：左段（上一轮）缺失、右段（这一轮）缺失。
+      const thisTier = row.tier === undefined || row.tier === null || row.tier === '' ? 'Default' : String(row.tier)
+      const previousTier = row.prevTier === undefined || row.prevTier === null || row.prevTier === '' ? 'Default' : String(row.prevTier)
+      return {
+        label: previousTier + ' → ' + thisTier,
+        detail: thisTier + ' → ' + row.effort + '（' + row.provider + '/' + row.model + '）',
+      }
+    }
+
+    /**
      * 输入框旁的档位芯片：显示这个会话最近一次判定。
      *
      * 轮询而不是订阅：静态 client bundle 拿不到宿主的推送通道，3 秒一次足够，
-     * 一次请求只回一条记录。判定还没发生时不渲染任何东西。
+     * 一次请求只回一条记录。开关关掉或者判定还没发生时什么都不渲染。
      */
     function EffortChip(props) {
       const sessionId = props === undefined || props === null ? undefined : props.sessionId
-      const [row, setRow] = React.useState(null)
+      const [view, setView] = React.useState(null)
 
       // 一次性的形状上报：把组件实际收到的 props 键名与 sessionId 传给宿主。
       // 排“拿不到会话”时不用再猜 props 叫什么。
@@ -542,10 +566,7 @@ window.__ModuleLoader__.load({
             const res = await fetch(LAST_ENDPOINT + query)
             const body = await res.json()
             if (!alive) return
-            const records = Array.isArray(body.records) ? body.records : []
-            const current = body.current !== null && body.current !== undefined ? body.current : null
-            // 本会话没有记录时退到最近一条：芯片要一直可见，多会话串一下比空着好查。
-            setRow(current !== null ? current : (records.length > 0 ? records[0] : null))
+            setView(chipView(body))
           } catch {
             /* 拿不到就不显示，别打扰输入 */
           }
@@ -558,27 +579,14 @@ window.__ModuleLoader__.load({
         }
       }, [sessionId])
 
-      // 三种「没有档位」都显示 Default：
-      // 一条记录都没有、左段（上一轮）缺失、右段（这一轮）缺失。
-      if (row === null || row === undefined) {
-        return h('div', {
-          style: S.chipBox,
-          role: 'status',
-          'aria-label': '暂无判定',
-          title: '暂无判定',
-        }, h('span', null, 'Default'))
-      }
-      const current = row.tier === undefined || row.tier === null || row.tier === '' ? 'Default' : String(row.tier)
-      const previous = row.prevTier === undefined || row.prevTier === null || row.prevTier === '' ? 'Default' : String(row.prevTier)
-      const label = `${previous} → ${current}`
-      const detail = `${current} → ${row.effort}（${row.provider}/${row.model}）`
+      if (view === null) return null
       // 纯文本 + aria-label：读屏能念出完整含义，悬停也能看到强度与模型。
       return h('div', {
         style: S.chipBox,
         role: 'status',
-        'aria-label': detail,
-        title: detail,
-      }, h('span', null, label))
+        'aria-label': view.detail,
+        title: view.detail,
+      }, h('span', null, view.label))
     }
 
     function apply(ctx) {
@@ -620,6 +628,8 @@ window.__ModuleLoader__.load({
 
     exports.name = 'effort-router-client'
     exports.inject = ['slots']
+    // 芯片的显示规则是纯函数，测试直接调它，不用起 DOM。
+    exports.chipView = chipView
     exports.apply = apply
     return module.exports
   },

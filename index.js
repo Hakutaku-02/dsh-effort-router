@@ -1706,6 +1706,8 @@ export function apply(ctx, config) {
       send(200, {
         records,
         current: current === undefined ? null : current,
+        // 开关关掉时芯片整个不出现：宿主把状态一起发过去，前端轮询一次就能决定。
+        enabled: live().enabled,
         seenAt: clientSeen.at,
         lastQuery: clientSeen.lastQuery,
         propsKeys: clientSeen.keys,
