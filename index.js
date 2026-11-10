@@ -222,11 +222,15 @@ export function pickByLadder(available, tier) {
 /**
  * 取本轮要写的强度。
  *
- * 默认走位置映射，不需要用户配置。只有用户把 tiers 改成非默认值时才按那张表走，
+ * 默认走位置映射，不需要用户配置。只有用户把三个判定档的落点改成非默认值时才按那张表走，
  * 保留手工精调的口子。
+ *
+ * `tiers.fallback` 不参与这个判断：它说的是判定失败时用哪个档位，与「档位落到哪个强度」
+ * 无关。算进去会让只改了 fallback 的配置被当成手工精调，于是低/中/高三档退化成按名字套，
+ * 像 gemini 的 low/medium/high 三档就再也落不到 medium（high 与 max 都落到 high，中间那档被跳过）。
  */
 function pickForTier(available, tier, tiers) {
-  const customised = Object.keys(DEFAULT_TIERS).some((key) => (tiers?.[key] ?? DEFAULT_TIERS[key]) !== DEFAULT_TIERS[key])
+  const customised = JUDGE_TIERS.some((key) => (tiers?.[key] ?? DEFAULT_TIERS[key]) !== DEFAULT_TIERS[key])
   if (customised) return pickEffort(available, tiers[tier] ?? tiers.fallback)
   return pickByLadder(available, tier)
 }
@@ -1729,6 +1733,9 @@ export function apply(ctx, config) {
         return { ok: false, detail: error && error.message ? error.message : String(error) }
       }
       if (clean.mode !== undefined) mode.current = clean.mode
+      // 切到本地后端的那一下就把服务拉起来。等服务收到第一条消息才拉，那一轮必然超时落兜底，
+      // 冷启动又要几十秒，用户会以为插件没生效。
+      if (live().judgeSource === 'local' && judge.state !== 'up') requestJudgeStart()
       return { ok: true, persisted: true }
     }
 

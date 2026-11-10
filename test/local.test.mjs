@@ -154,6 +154,31 @@ const workdir = mkdtempSync(join(tmpdir(), 'effort-router-local-'))
   await new Promise((resolve) => setTimeout(resolve, 500))
 }
 
+// 二点五、在设置页切到「本地」的那一下就要拉起服务，别等第一条消息（那一轮必然超时落兜底）
+{
+  const pidFile = join(workdir, 'prewarm.pid')
+  const serviceScript = join(workdir, 'prewarm-service.mjs')
+  writeFileSync(serviceScript, 'import { writeFileSync } from "node:fs"\n'
+    + 'writeFileSync(' + JSON.stringify(pidFile) + ', String(process.pid))\n'
+    + 'process.exit(0)\n')
+  const ctx = makeContext({ settings: { judgeSource: 'jev', judgeUrl: 'http://127.0.0.1:1/judge' } })
+  apply(ctx, {
+    mode: 'auto',
+    autoStart: true,
+    provision: false,
+    startupWaitMs: 0,
+    startWaitMs: 0,
+    servicePython: process.execPath,
+    serviceScript,
+    judgeUrl: 'http://127.0.0.1:1/judge',
+  })
+  check('预热: 一开始没有服务', existsSync(pidFile), false)
+  const saved = await callRoute(ctx, '/effort-router/config', { judgeSource: 'local' })
+  check('预热: 切换保存成功', saved.body.ok, true)
+  const ran = await waitFor(() => existsSync(pidFile), 5000)
+  check('预热: 保存后就拉起，不等消息', ran, true)
+}
+
 // 三、两个后端都发全文（截断会改判定结果）
 {
   const port = await freePort()

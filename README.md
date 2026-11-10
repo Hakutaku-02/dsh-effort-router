@@ -127,7 +127,7 @@ dsh plugin --profile web install github:Hakutaku-02/dsh-effort-router
 | `serviceScript` | `laya_router.py` 的路径，例如 `<包目录>/service/laya_router.py`，或用镜像目录 `~/.dsh/router-effort/laya/service/laya_router.py` |
 | `serviceModel` | 权重目录，拉起时作为 `LAYA_MODEL` 传给服务 |
 
-三个都填对，插件在启动时（`judgeSource` 已经是 `local`）或用户切到「本地」后的第一条消息里，把服务拉起来：
+三个都填对，插件在启动时（`judgeSource` 已经是 `local`）、用户切到「本地」的那一次保存、以及判定时发现服务不在线，都会把服务拉起来。保存时拉起是为了别把冷启动压在第一条消息上：那 60 秒里发出去的每轮都只能落兜底档。
 
 ```bash
 python <laya_router.py> --http --port 8765     # 环境变量 LAYA_MODEL=<serviceModel>
@@ -176,11 +176,13 @@ node weights/fetch.mjs                                                        # 
 
 | 模型 | 声明的强度 | 判定 low | 判定 high | 判定 max |
 | --- | --- | --- | --- | --- |
-| deepseek-v4.1-flash | low / high / max | low | high | max |
-| minimax-m3.1-flash | low / medium / high / xhigh / max | low | high | max |
-| gemini | low / medium / high | low | medium | high |
+| deepseek-flash（tokenflux） | low / high / max | low | high | max |
+| MiniMax-M3.1-Flash（minimax-mplan） | low / medium / high / xhigh / max | low | high | max |
+| gemini-3.8-flash（tokenflux） | low / medium / high | low | medium | high |
 
-想手工指定落点就改 `tiers`，只要它与默认值不同，插件就按那张表走。
+五档模型只落 low / high / max：中间档取的是梯子的中间那一格（`high`），`medium` 与 `xhigh` 不会被选中。三档模型（gemini）用满 low / medium / high。
+
+想手工指定落点就改 `tiers` 里 `low`、`high`、`max` 的强度名，只要其中之一与默认值不同，插件就按那张表按名字取。`tiers.fallback` 不参与这个判断，它只决定判定失败时用哪个档。
 
 ## 判定源
 

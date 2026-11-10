@@ -140,6 +140,24 @@ function ask(ctx, path, url = path) {
   check('诊断: 缺参数回 400', bad.code, 400)
 }
 
+// 三个判定档的落点没改时按位置映射：fallback 改了不算手工精调
+// （用户的真实配置常常是 fallback: high，旧逻辑会因此把 gemini 的 medium 整档跳过）
+{
+  const GEMINI = [{ id: 'low' }, { id: 'medium' }, { id: 'high' }]
+  const { ctx } = fresh(GEMINI, { tiers: { low: 'low', high: 'high', max: 'max', fallback: 'high' } })
+  const low = await ask(ctx, '/effort-router/models', '/effort-router/models?provider=gog&model=gemini&tier=low')
+  const high = await ask(ctx, '/effort-router/models', '/effort-router/models?provider=gog&model=gemini&tier=high')
+  const max = await ask(ctx, '/effort-router/models', '/effort-router/models?provider=gog&model=gemini&tier=max')
+  check('三档模型: 简单落最低', low.body.picked, 'low')
+  check('三档模型: 中等落中间（medium 没被跳过）', high.body.picked, 'medium')
+  check('三档模型: 困难落最高', max.body.picked, 'high')
+
+  // 手工改了判定档的落点才算精调，这时按名字映射，不再按位置
+  const pinned = fresh(GEMINI, { tiers: { low: 'low', high: 'medium', max: 'high', fallback: 'high' } })
+  const pinnedHigh = await ask(pinned.ctx, '/effort-router/models', '/effort-router/models?provider=gog&model=gemini&tier=high')
+  check('精调: 按名字映射', pinnedHigh.body.picked, 'medium')
+}
+
 // 芯片的数据源：每个会话最近一次判定
 {
   const { ctx } = fresh()
