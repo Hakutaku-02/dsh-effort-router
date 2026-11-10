@@ -11,6 +11,8 @@
  * 判定服务自己退出时（端口被别人占着、权重缺失），本脚本跟着退出，不重拉。要不要再拉由插件决定。
  */
 import { spawn, spawnSync } from 'node:child_process'
+import { mkdirSync, rmSync, writeFileSync } from 'node:fs'
+import { dirname } from 'node:path'
 
 const argv = process.argv.slice(2)
 const option = (name) => {
@@ -22,6 +24,7 @@ const python = option('--python')
 const script = option('--script')
 const port = option('--port') ?? '8765'
 const model = option('--model')
+const pidFile = option('--pid-file')
 const parent = Number(option('--parent'))
 /** 看父进程的间隔。1 秒意味着 DSH 死掉后判定服务最多多活 1 秒。 */
 const POLL_MS = 1000
@@ -47,6 +50,31 @@ function log(message) {
 
 log('启动 ' + python + '（pid ' + (child.pid ?? '?') + '），看父进程 ' + parent)
 
+/**
+ * 记下「谁在看管这份服务」。
+ *
+ * 插件读这份记录来判断「服务在线是不是有人看管」。本进程正常退出时把它删掉，
+ * 所以残留的记录本身就意味着上一次没走干净，插件据此不会谎报有人在看管。
+ */
+if (typeof pidFile === 'string' && pidFile !== '') {
+  try {
+    mkdirSync(dirname(pidFile), { recursive: true })
+    writeFileSync(pidFile, JSON.stringify({ supervisor: process.pid, service: child.pid ?? null, parent, at: Date.now() }) + '\n')
+  } catch (error) {
+    log('写 pid 文件失败：' + (error && error.message ? error.message : String(error)))
+  }
+}
+
+/** 退出时抹掉记录。看门人还在时这条记录才有意义。 */
+function forgetPidFile() {
+  if (typeof pidFile !== 'string' || pidFile === '') return
+  try {
+    rmSync(pidFile, { force: true })
+  } catch {
+    /* 删不掉就算了，插件那边还有 pid 兜底 */
+  }
+}
+
 child.on('error', (error) => {
   log('拉起失败：' + (error && error.message ? error.message : String(error)))
   process.exit(1)
@@ -54,6 +82,7 @@ child.on('error', (error) => {
 
 child.on('exit', (code, signal) => {
   log('判定服务退出（code ' + code + '，signal ' + signal + '）')
+  forgetPidFile()
   process.exit(code === null ? 0 : code)
 })
 
@@ -82,6 +111,7 @@ function stop(reason) {
       child.kill('SIGKILL')
     }
   }
+  forgetPidFile()
   process.exit(0)
 }
 
@@ -94,6 +124,7 @@ for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP']) {
   process.on(signal, () => stop('收到 ' + signal))
 }
 process.on('exit', () => {
+  forgetPidFile()
   if (!stopping && child.pid !== undefined && process.platform === 'win32') {
     spawnSync('taskkill', ['/PID', String(child.pid), '/T', '/F'], { windowsHide: true })
   }

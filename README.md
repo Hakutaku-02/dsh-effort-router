@@ -3,7 +3,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-0.4.2-3B82F6?style=flat-square" alt="version">
+  <img src="https://img.shields.io/badge/version-0.4.3-3B82F6?style=flat-square" alt="version">
   <img src="https://img.shields.io/badge/license-MIT-12B981?style=flat-square" alt="license">
   <img src="https://img.shields.io/badge/node-%3E%3D18-8B5CF6?style=flat-square" alt="node">
   <img src="https://img.shields.io/badge/dsh-%3E%3D0.2.2--rc.1-0EA5E9?style=flat-square" alt="dsh">
@@ -138,6 +138,8 @@ python <laya_router.py> --http --port 8765     # 环境变量 LAYA_MODEL=<servic
 服务拉起后约 60 秒完成权重加载，状态从 `starting` 转 `up`。这期间请求照常发出，落兜底档。
 
 判定服务不直接挂在 DSH 下面，而是由 `supervisor.mjs` 看管：它每秒看一次 DSH 的 pid，DSH 退出或被强行结束后，用 `taskkill /T` 把 python 整棵进程树结束掉，然后自己退出。所以关掉 DSH，端口 8765 和那份权重占的内存会一起放掉，不需要手工清理。
+
+看门人启动时在 `~/.dsh/router-effort/service.pid` 写下自己的 pid，正常退出时删掉。服务在线但这条记录缺失、或者记录里的看门人已经不在时，`/effort-router/judge` 的 `detail` 会写明「服务在线但不在看门人管下（旧版遗留或手工启动），退出 DSH 后它不会自己结束」。判断看管状态时先看本进程拉起过的看门人（子进程对象），pid 探测只用于跨进程兜底，因为 pid 会被系统复用。
 
 早于 0.4.3 的版本拉起的判定服务没人在看管，升级后它会一直占着端口（探活能通，插件就不会重复拉起）。升级那一次手工结束它：
 

@@ -491,24 +491,19 @@ function startService(base, python, script, model) {
       '--python', python,
       '--script', script,
       '--port', port,
+      '--pid-file', join(provisionRoot(), 'service.pid'),
       ...(typeof model === 'string' && model !== '' ? ['--model', model] : []),
       '--parent', String(process.pid),
     ], {
       windowsHide: true,
       stdio: ['ignore', 'ignore', fd === undefined ? 'ignore' : fd],
     })
+    // 本进程拉起的看门人记在这里：判断「有没有人在看管」先看这张表里的子进程对象，
+    // 光靠 pid 探测会被复用的 pid 骗过去。pid 文件由看门人自己写、退出时自己删。
+    supervisors.add(child)
+    child.on('exit', () => { supervisors.delete(child) })
     // unref 让看门人进程不拖住 DSH 的事件循环；它的生死由父 pid 轮询决定，不靠这里的句柄。
     child.unref()
-    // 记下看门人 pid：下次启动时用它区分「我们拉起、有人看管」和「旧版遗留、没人看管」的服务。
-    try {
-      mkdirSync(provisionRoot(), { recursive: true })
-      writeFileSync(
-        join(provisionRoot(), 'service.pid'),
-        JSON.stringify({ supervisor: child.pid ?? null, parent: process.pid, at: Date.now() }) + '\n',
-      )
-    } catch {
-      /* 写不了就算了，只影响状态说明 */
-    }
     const weights = typeof model === 'string' && model !== '' ? '，权重 ' + model : ''
     return '已拉起判定服务（' + python + weights + '，pid ' + (child.pid ?? '?') + '，随 DSH 退出）'
   } catch (error) {
@@ -540,22 +535,47 @@ function provisionRoot() {
   return process.env.ROUTER_EFFORT_HOME || join(homedir(), '.dsh', 'router-effort')
 }
 
-/**
- * 上一次拉起的看门人还活着吗。
- *
- * 服务在线不代表它随 DSH 生死：旧版本直接 detached 拉起 python，没有看门人；用户也可能自己
- * 起了一份。这里只回报事实，不去结束别人的进程。
- */
-function supervisorAlive() {
+/** 本进程拉起过的看门人。它们的存活状态以子进程对象为准，pid 文件只用来跨进程溯源。 */
+const supervisors = new Set()
+
+/** pid 还活着吗。只用于跨进程兜底：pid 会被系统复用，单独信它会把死的说成活的。 */
+function alivePid(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false
   try {
-    const recorded = JSON.parse(readFileSync(join(provisionRoot(), 'service.pid'), 'utf8'))
-    const pid = Number(recorded?.supervisor)
-    if (!Number.isInteger(pid) || pid <= 0) return false
     process.kill(pid, 0)
     return true
   } catch {
     return false
   }
+}
+
+/**
+ * 当前在跑的服务有没有人看管。
+ *
+ * 服务在线不等于它随 DSH 生死：旧版本直接 detached 拉起 python，没有看门人；用户也可能自己
+ * 起了一份。只回报事实，不去结束别人的进程。
+ *
+ * 判断顺序有讲究：
+ * 1. 本进程拉起的看门人看子进程对象。pid 文件是过去的事实，pid 被复用或进程对象没回收时，
+ *    pid 探测会把一个已经死掉的看门人报成活着。
+ * 2. 记录里 parent 就是本进程时一律不认：我们拉起的看门人都在上面那张表里，表里没有它，
+ *    说明这条记录是死人留下的（或者本进程复用了旧 pid）。表里没有就说明没人看管。
+ * 3. 剩下的跨进程情形才读 pid：父 DSH 和看门人都活着才算有人管。看门人正常退出时会删掉
+ *    这份记录，所以残留记录本身就说明它没走干净。
+ */
+function supervisorAlive() {
+  for (const child of supervisors) {
+    if (child.exitCode === null && child.signalCode === null) return true
+  }
+  let recorded
+  try {
+    recorded = JSON.parse(readFileSync(join(provisionRoot(), 'service.pid'), 'utf8'))
+  } catch {
+    return false
+  }
+  const parent = Number(recorded?.parent)
+  if (parent === process.pid) return false
+  return alivePid(parent) && alivePid(Number(recorded?.supervisor))
 }
 
 /** 最近判定落盘的位置。重启后芯片要能显示上一次的档位。 */
