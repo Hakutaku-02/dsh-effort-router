@@ -19,6 +19,3 @@ package-lock.json
 
 # Bug文档
 docs/
-
-# 测试文件
-test/
