@@ -13,6 +13,9 @@
   },
   "files": [
     "index.js",
+    "effort.mjs",
+    "config",
+    "http",
     "supervisor.mjs",
     "client.js",
     "cordis.patch.yml",
@@ -39,9 +42,11 @@
     "dsh-router-laya": "^2.2.1"
   },
   "scripts": {
-    "test": "node test/effort.test.mjs && node test/apply.test.mjs && node test/mirror.test.mjs && node test/provision.test.mjs && node test/health.test.mjs && node test/lifecycle.test.mjs && node test/local.test.mjs && node test/config.test.mjs && node test/cache.test.mjs && node test/persist.test.mjs && node test/jev.test.mjs && node test/key.test.mjs && node test/client.test.mjs && node test/legacy.test.mjs",
+    "test": "node test/effort.test.mjs && node test/apply.test.mjs && node test/mirror.test.mjs && node test/provision.test.mjs && node test/health.test.mjs && node test/lifecycle.test.mjs && node test/local.test.mjs && node test/config.test.mjs && node test/cache.test.mjs && node test/persist.test.mjs && node test/jev.test.mjs && node test/key.test.mjs && node test/client.test.mjs && node test/legacy.test.mjs && node test/resolve.test.mjs && node test/validate.test.mjs",
     "test:cordis": "node test/cordis.test.mjs",
-    "prepublishOnly": "npm test"
+    "test:coverage": "c8 npm test",
+    "lint": "eslint .",
+    "prepublishOnly": "npm test && npm run lint"
   },
   "keywords": [
     "dsh-plugin",
@@ -58,5 +63,12 @@
   "bugs": {
     "url": "https://github.com/Hakutaku-02/dsh-effort-router/issues"
   },
-  "homepage": "https://github.com/Hakutaku-02/dsh-effort-router#readme"
+  "homepage": "https://github.com/Hakutaku-02/dsh-effort-router#readme",
+  "devDependencies": {
+    "@eslint/js": "^9.39.5",
+    "c8": "^12.0.0",
+    "eslint": "^9.39.5",
+    "globals": "^16.5.0",
+    "prettier": "^3.9.10"
+  }
 }

@@ -552,8 +552,7 @@ window.__ModuleLoader__.load({
         } catch {
           /* 自检失败不影响功能 */
         }
-        // 只在挂载时报一次
-        // eslint-disable-next-line react-hooks/exhaustive-deps
+        // 只在挂载时报一次：props 的键名不进依赖数组，挂载后再变也不重报。
       }, [])
 
       React.useEffect(() => {
@@ -630,6 +629,10 @@ window.__ModuleLoader__.load({
     exports.inject = ['slots']
     // 芯片的显示规则是纯函数，测试直接调它，不用起 DOM。
     exports.chipView = chipView
+    // 档位词汇在这里是第二份（宿主侧那份在 config/settings.mjs），测试比对两边是否仍然一致。
+    exports.TIER_KEYS = TIER_KEYS
+    exports.DEFAULT_TIERS = DEFAULT_TIERS
+    exports.EFFORTS = EFFORTS
     exports.apply = apply
     return module.exports
   },

@@ -304,16 +304,28 @@ curl "http://127.0.0.1:<GUI 端口>/effort-router/judge"
 ## 开发
 
 ```bash
-npm test            # 13 个测试文件，不联网
-npm run test:cordis # 在真 cordis 上下文里跑挂载与事件
+npm test             # 16 个测试文件，不联网
+npm run test:cordis  # 在真 cordis 上下文里跑挂载与事件，找不到 DSH 安装目录时跳过
+npm run test:coverage # 先跑 npm test，再出覆盖率；行覆盖低于 85% 退出码非 0
+npm run lint         # eslint，与 CI 同一条命令
 ```
 
-测试不读 `node_modules`，克隆下来直接跑 `npm test` 就行。`@deepseek-ai/schemastery` 由 profile 提供；`npm install` 会装上 `dsh-router-laya`，部署判定服务时用它。CI 跑 Node 20、22、24。
+测试不读 `node_modules`，克隆下来直接跑 `npm test` 就行。`@deepseek-ai/schemastery` 由 profile 提供；`npm install` 会装上 `dsh-router-laya`，部署判定服务时用它。CI 跑 Node 20、22、24，每一步都过 lint 与覆盖率门槛。
+
+格式由 `.prettierrc.json` 描述（无分号、单引号、行宽 160）。整仓还没按它重排过，所以 `prettier --check` 暂时不进 CI；改到哪个文件就用 `npx prettier --write <文件>` 对齐。
 
 ```
 .
-├── index.js           宿主侧：判定、落位、部署、路由
+├── index.js           宿主侧入口：判定、落位、落盘、服务生命周期、事件接线
+├── effort.mjs         强度词汇，以及「判定档位 → 模型强度」的落位规则
+├── config/
+│   ├── settings.mjs   配置项的名字与默认值、本轮配置的合成
+│   └── validate.mjs   设置页补丁的校验
+├── http/
+│   ├── routes.mjs     九条插件路由
+│   └── respond.mjs    写响应、读 JSON 请求体、同源检查
 ├── client.js          前端：设置页与输入框芯片
+├── supervisor.mjs     判定服务的看门人，随 DSH 退出
 ├── assets/            README 用的 banner
 ├── locale/            插件列表里的标题与描述
 ├── test/              单元测试，不依赖网络；fake-host.mjs 是 0.2.2 时序的测试替身

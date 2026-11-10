@@ -4,6 +4,8 @@
  * 这里不起 DOM，也不装 react：client.js 是 client module system 的工厂 bundle，
  * 用假的 __ModuleLoader__ 拿到工厂、给个最小 react 替身，只测 chipView 这个纯函数。
  */
+import { DEFAULT_TIERS as HOST_DEFAULT_TIERS, TIER_KEYS as HOST_TIER_KEYS } from '../config/settings.mjs'
+import { strengthOf } from '../effort.mjs'
 import { makeChecker } from './fake-host.mjs'
 
 const { check, done } = makeChecker()
@@ -76,5 +78,13 @@ check('缺 enabled: 当作开着', chipView({ records: [], current: record() }),
 
 // 响应不是对象：不要炸
 check('异常响应: 显示 Default', chipView(null), { label: 'Default', detail: '暂无判定' })
+
+// 档位词汇两边各存一份：宿主侧在 config/settings.mjs，浏览器侧在 bundle 里。
+// 任一边加了强度名而另一边没跟，这里会红。
+check('两侧一致: 档位键', mod.TIER_KEYS, HOST_TIER_KEYS)
+check('两侧一致: 默认落点', mod.DEFAULT_TIERS, HOST_DEFAULT_TIERS)
+check('两侧一致: 强度词汇都被宿主认识', mod.EFFORTS.map((id) => strengthOf(id) !== undefined), mod.EFFORTS.map(() => true))
+check('两侧一致: 强度词汇按由弱到强排', mod.EFFORTS.map((id) => strengthOf(id)), [...mod.EFFORTS.keys()])
+check('两侧一致: 下拉里没有 off', mod.EFFORTS.includes('off'), true)
 
 done()

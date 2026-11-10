@@ -199,7 +199,6 @@ const workdir = mkdtempSync(join(tmpdir(), 'effort-router-local-'))
 
 {
   const port = await freePort()
-  const recordPath = join(workdir, 'slice-jev.json')
   const seen = []
   const server = createServer((req, res) => {
     let raw = ''

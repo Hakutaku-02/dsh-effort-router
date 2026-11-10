@@ -15,6 +15,9 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: ${{ matrix.node }}
-      # 不跑 install：测试都不 import 运行时依赖 dsh-router-laya，
-      # 镜像与部署用的是临时目录里造的假包。
-      - run: npm test
+      # eslint 与 c8 在 devDependencies 里；测试本身不 import 运行时依赖，
+      # 但 npm install 会按 package.json 把 dsh-router-laya 一起装上。
+      - run: npm install --no-audit --no-fund
+      - run: npm run lint
+      # 覆盖率门槛写在 .c8rc.json：行覆盖 85%。
+      - run: npm run test:coverage

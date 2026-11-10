@@ -183,7 +183,7 @@ function preStep(ctx, agent, messages = []) {
 // notify：只管提示，不影响写强度；提示本身在这里看得出区别
 {
   const { ctx, updates } = fresh({ settings: defaultSettings() })
-  const saved = await callRoute(ctx, '/effort-router/config', { notify: 'off' })
+  await callRoute(ctx, '/effort-router/config', { notify: 'off' })
   check('提示: 落盘参数', updates[0]?.patch, { notify: 'off' })
 
   const quiet = makeAgent({ id: 'session-config-notify', reasoningEffort: 'low' })

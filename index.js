@@ -10,6 +10,12 @@
  * 被扣住到写完为止——0.2.2 在 pre-step 之前就快照模型选择，晚于这个点写只对下一步生效。
  *
  * 判定服务不可用时会落兜底档位（该会话上一轮的档位，没有就用 tiers.fallback），不阻塞这一轮。
+ *
+ * 模块划分：
+ * - `effort.mjs`：强度词汇，以及「判定档位 → 模型自己的强度」的落位规则；
+ * - `config/`：配置项的名字与默认值、本轮配置的合成、设置补丁的校验；
+ * - `http/`：九条插件路由，只做传输与请求校验；
+ * - 本文件：判定、凭据、落位写入、落盘记录、服务生命周期与事件接线。
  */
 
 import { spawn } from 'node:child_process'
@@ -21,26 +27,31 @@ import { fileURLToPath } from 'node:url'
 import { join } from 'node:path'
 // profile 提供的 peer：包落在能解析到 harness 的 node_modules 下就能裸解析。
 import z from '@deepseek-ai/schemastery'
+import {
+  DEFAULT_JEV_CONFIDENCE,
+  DEFAULT_JEV_MODEL,
+  DEFAULT_JEV_URL,
+  DEFAULT_JUDGE,
+  DEFAULT_TIERS,
+  JEV_KEY_REF,
+  JEV_TIMEOUT_MS,
+  JUDGE_SOURCES,
+  JUDGE_TIMEOUT_MS,
+  JUDGE_TIERS,
+  MODES,
+  TIER_KEYS,
+  resolveLive,
+  toMs,
+  valueOf,
+} from './config/settings.mjs'
+import { validatePatch } from './config/validate.mjs'
+import { pickForTier, strengthOf } from './effort.mjs'
+import { ROUTE_PREFIXES, createRoutes } from './http/routes.mjs'
+// 强度词汇与落位规则在 effort.mjs；测试与外部脚本按包入口取。
+export { ladderOf, pickByLadder, pickEffort, strengthOf } from './effort.mjs'
 
 export const name = 'effort-router'
 
-const DEFAULT_JUDGE = 'http://127.0.0.1:8765/judge'
-const JUDGE_TIMEOUT_MS = 20000
-/**
- * hold 阶段等判定的上限。
- *
- * 判定跑在 `runMaintenance` 里，本轮唤醒被扣住，第一个 token 要等判定结束才出来，
- * 等待时间就是判定耗时。预算给这次等待划一条线：超了就落兜底档，请求照常发出。
- *
- * 两个后端分开给，按实测定（2026-11-10，846MB CPU 微调判定服务）：本地服务的单次判定
- * 跟内容强相关，规则快路径 7 到 45ms，常见提问 p50 2.9 秒、p90 4.3 秒，120 到 180 字
- * 要 5 到 7 秒，长文本撞 12 秒饱和线。6000ms 覆盖常见提问，更长的文本按兜底档放行。
- * Jev 是公网决策端点，实测 1 到 2 秒，给 3000ms。
- * 实测记录在 docs/20261110-local-restore/report.md。
- */
-const JUDGE_HOLD_TIMEOUT_MS = 6000
-/** Jev 的 hold 预算：覆盖公网往返与端点排队，仍留出「超时也要放行」的余地。 */
-const JEV_HOLD_TIMEOUT_MS = 3000
 /** 拉起判定服务失败后，隔多久再自动试一次。 */
 const JUDGE_START_RETRY_MS = 60000
 /** 部署（装 venv、下权重）失败后的冷却：那条路每次都重跑整个脚本，不该每分钟来一次。 */
@@ -63,16 +74,6 @@ const SERVICE_LOG_PATH = `${tmpdir()}/laya-router-service.log`
 const SETUP_LOG_PATH = `${tmpdir()}/router-effort-setup.log`
 /** 挂载痕迹。宿主没有稳定的 stderr 落盘，这里记一行，重启后能确认插件到底有没有挂上。 */
 const MOUNT_LOG_PATH = `${tmpdir()}/router-effort.log`
-
-/** 判定后端。local 走本机服务；jev 走 TypeSafe 的 System One 决策端点。 */
-const JUDGE_SOURCES = ['local', 'jev']
-const MODES = ['auto', 'manual']
-
-/** 档位到强度名的默认映射，也是页面里那四个下拉的名字。 */
-const TIER_KEYS = ['low', 'high', 'max', 'fallback']
-/** 判定后端真正会回的档位。fallback 只是映射表的一个键，不是判定结果。 */
-const JUDGE_TIERS = ['low', 'high', 'max']
-const DEFAULT_TIERS = { low: 'low', high: 'high', max: 'max', fallback: 'low' }
 /** 最近判定的保留条数。落盘和芯片列表都用它。 */
 const MAX_RECENT = 100
 /**
@@ -85,18 +86,8 @@ const MAX_RECENT = 100
 const RECORD_SCHEMA_VERSION = 2
 /** 档位没变化时，最多这么久也刷一次盘。 */
 const SAVE_INTERVAL_MS = 60000
-/** 查询参数的长度上限。端点名与模型名都很短，超长的一律当非法。 */
-const MAX_QUERY_LENGTH = 200
 /** 模型档位缓存的容量上限，防止外部传入的端点名把这张表撑大。 */
 const MAX_MODEL_CACHE = 200
-
-/** Jev 的默认值：TypeSafe 官方的 System One 决策端点。它不接受 chat/completions。 */
-const DEFAULT_JEV_URL = 'https://api.typesafe.ai/v1/systemone'
-const DEFAULT_JEV_MODEL = 'jev-latest'
-const JEV_KEY_REF = 'TYPESAFE_API_KEY'
-const DEFAULT_JEV_CONFIDENCE = 0.6
-const JEV_TIMEOUT_MS = 12000
-
 /**
  * 三个档位的判定描述。
  *
@@ -175,84 +166,6 @@ function trace(message) {
   } catch {
     /* 写不了就算了 */
   }
-}
-
-/**
- * 强度从弱到强。各厂商词汇不同（deepseek 只有 low/high/max，minimax 多 medium/xhigh），
- * 这里只做跨厂商的粗序，认不出的强度当作未知。
- */
-const ORDER = ['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max']
-
-/** 一个强度名在 ORDER 里的位置；未知返回 undefined。 */
-export function strengthOf(effort) {
-  const index = ORDER.indexOf(String(effort ?? '').toLowerCase())
-  return index === -1 ? undefined : index
-}
-
-/**
- * 把模型的档位列表整理成梯子：去掉 off（那是关掉思考，不是一档强度），按强弱排序。
- */
-export function ladderOf(available) {
-  return (available ?? [])
-    .map((id) => ({ id, index: strengthOf(id) }))
-    .filter((entry) => entry.index !== undefined && String(entry.id).toLowerCase() !== 'off')
-    .sort((left, right) => left.index - right.index)
-    .map((entry) => entry.id)
-}
-
-/**
- * 把判定的三档按相对位置落到模型自己的梯子上。
- *
- * low 取最低档，high 取中间档，max 取最高档。这样每个模型都能用满自己的范围：
- * deepseek 的三档（low/high/max）落成 low/high/max；
- * gemini 的三档（low/medium/high）落成 low/medium/high；
- * minimax 的五档（low/medium/high/xhigh/max）落成 low/high/max。
- *
- * 不按名字硬套的理由：名字套会让「没有 max 的模型」把 max 压到 high，
- * 让「有 xhigh 的模型」永远用不到 medium 与 xhigh。
- */
-export function pickByLadder(available, tier) {
-  const ladder = ladderOf(available)
-  if (ladder.length === 0) return undefined
-  const last = ladder.length - 1
-  const offset = tier === 'max' ? last : tier === 'low' ? 0 : Math.round(last / 2)
-  return ladder[Math.min(Math.max(offset, 0), last)]
-}
-
-/**
- * 取本轮要写的强度。
- *
- * 默认走位置映射，不需要用户配置。只有用户把三个判定档的落点改成非默认值时才按那张表走，
- * 保留手工精调的口子。
- *
- * `tiers.fallback` 不参与这个判断：它说的是判定失败时用哪个档位，与「档位落到哪个强度」
- * 无关。算进去会让只改了 fallback 的配置被当成手工精调，于是低/中/高三档退化成按名字套，
- * 像 gemini 的 low/medium/high 三档就再也落不到 medium（high 与 max 都落到 high，中间那档被跳过）。
- */
-function pickForTier(available, tier, tiers) {
-  const customised = JUDGE_TIERS.some((key) => (tiers?.[key] ?? DEFAULT_TIERS[key]) !== DEFAULT_TIERS[key])
-  if (customised) return pickEffort(available, tiers[tier] ?? tiers.fallback)
-  return pickByLadder(available, tier)
-}
-/**
- * 在 `available` 里挑一个不超过 `target` 的最强档。
- *
- * 这是「按名字映射」的走法，只在用户手工改过 tiers 时用。
- * 模型全部比 target 强时给最弱那个；available 为空或全是不认识的强度名时返回 undefined。
- */
-export function pickEffort(available, target) {
-  const targetIndex = strengthOf(target)
-  if (targetIndex === undefined) return undefined
-  const known = (available ?? [])
-    .map((id) => ({ id, index: strengthOf(id) }))
-    .filter((entry) => entry.index !== undefined)
-    .sort((left, right) => left.index - right.index)
-  if (known.length === 0) return undefined
-  let best
-  for (const entry of known) {
-    if (entry.index <= targetIndex) best = entry.id
-  }
-  return best ?? known[0].id
 }
 
 /** 一条消息里的纯文本，拼起来；没有文本时返回空串。 */
@@ -389,28 +302,6 @@ function entryIdOf(ctx, fallback) {
     /* 拿不到就用默认 */
   }
   return fallback
-}
-
-/**
- * volatile 字段在运行时是个带 `get()` 的句柄，不是普通值。
- * 普通字段原样返回；句柄读一次拿当前值；取不到时用 fallback。
- */
-function valueOf(input, fallback) {
-  try {
-    if (input !== undefined && input !== null && typeof input.get === 'function') {
-      const value = input.get()
-      return value === undefined ? fallback : value
-    }
-  } catch {
-    /* 落到 fallback */
-  }
-  return input === undefined || input === null ? fallback : input
-}
-
-/** 配置里的毫秒值可能是 YAML 数字也可能是字符串；不合法时用默认值。 */
-function toMs(value, fallback) {
-  const number = Number(value)
-  return Number.isFinite(number) && number >= 0 ? number : fallback
 }
 
 /**
@@ -768,33 +659,13 @@ export function apply(ctx, config) {
   const mode = { current: valueOf(cfg.mode, 'auto') === 'manual' ? 'manual' : 'auto' }
 
   /**
-   * 热改字段的当前值：设置面优先，读不到用挂载时的快照。
+   * 本轮配置：设置面当前值优先，读不到退回挂载快照。
    * 一轮读一次就够，调用方把结果往下传，避免同一轮反复 describe。
+   *
+   * 合并规则在 config/settings.mjs 的 resolveLive：纯函数，单测直接喂输入。
    */
   function live() {
-    const values = liveSettings(ctx, entryId)
-    const tierSource = values?.tiers !== undefined && values.tiers !== null && typeof values.tiers === 'object'
-      ? { ...tiers, ...values.tiers }
-      : tiers
-    const judgeSource = JUDGE_SOURCES.includes(values?.judgeSource)
-      ? values.judgeSource
-      : (valueOf(cfg.judgeSource, 'local') === 'jev' ? 'jev' : 'local')
-    return {
-      enabled: typeof values?.enabled === 'boolean' ? values.enabled : valueOf(cfg.enabled, true) !== false,
-      mode: MODES.includes(values?.mode) ? values.mode : mode.current,
-      judgeSource,
-      judgeUrl: typeof values?.judgeUrl === 'string' && values.judgeUrl !== '' ? values.judgeUrl : mountedJudgeUrl,
-      notify: typeof values?.notify === 'string' ? values.notify : String(valueOf(cfg.notify, '') ?? ''),
-      tiers: { ...DEFAULT_TIERS, ...tierSource },
-      jevUrl: typeof values?.jevUrl === 'string' && values.jevUrl !== '' ? values.jevUrl : (valueOf(cfg.jevUrl, '') || DEFAULT_JEV_URL),
-      jevModel: typeof values?.jevModel === 'string' && values.jevModel !== '' ? values.jevModel : (valueOf(cfg.jevModel, '') || DEFAULT_JEV_MODEL),
-      jevApiKeyEnv: typeof values?.jevApiKeyEnv === 'string' && values.jevApiKeyEnv !== '' ? values.jevApiKeyEnv : (valueOf(cfg.jevApiKeyEnv, '') || JEV_KEY_REF),
-      jevConfidence: Number.isFinite(Number(values?.jevConfidence)) ? Number(values.jevConfidence) : toMs(cfg.jevConfidence, DEFAULT_JEV_CONFIDENCE),
-      jevTimeoutMs: toMs(values?.jevTimeoutMs ?? cfg.jevTimeoutMs, JEV_TIMEOUT_MS),
-      // 没配预算时按后端给默认值：Jev 是公网往返，本地服务是同机调用。
-      judgeTimeoutMs: toMs(values?.judgeTimeoutMs ?? cfg.judgeTimeoutMs, judgeSource === 'jev' ? JEV_HOLD_TIMEOUT_MS : JUDGE_HOLD_TIMEOUT_MS),
-      legacyOwned: typeof values?.legacyOwned === 'boolean' ? values.legacyOwned : valueOf(cfg.legacyOwned, true) !== false,
-    }
+    return resolveLive(liveSettings(ctx, entryId), cfg, { judgeUrl: mountedJudgeUrl, mode: mode.current, tiers })
   }
 
   trace(`mounted mode=${mode.current} judge=${mountedJudgeUrl} entry=${entryId}`)
@@ -1609,494 +1480,72 @@ export function apply(ctx, config) {
 
   // 运行时开关：GET 读当前模式，POST body {"mode":"auto"|"manual"} 切换。
   // 旧路径 /router-effort/* 保留为别名，README 与已有脚本里的 curl 继续可用。
+
+  /**
+   * 把改动写回 profile。这是设置页保存的唯一落盘路径；没有设置面时退回内存开关。
+   *
+   * 失败分两类：字段本身不合法回 400，设置服务写不进去回 503。两者都带 detail。
+   */
+  const writeConfig = async (patch) => {
+    const checked = validatePatch(patch)
+    if (!checked.ok) return checked
+    const clean = checked.clean
+    let settings
+    try {
+      settings = ctx.get('settings')
+    } catch {
+      settings = undefined
+    }
+    if (settings === undefined || settings === null || typeof settings.update !== 'function') {
+      if (clean.mode === undefined) return { ok: false, detail: '设置服务不可用' }
+      mode.current = clean.mode
+      return { ok: true, persisted: false, detail: '设置服务不可用，只改了内存里的模式' }
+    }
+    try {
+      await settings.update(entryId, clean)
+    } catch (error) {
+      return { ok: false, detail: error && error.message ? error.message : String(error) }
+    }
+    if (clean.mode !== undefined) mode.current = clean.mode
+    // 切到本地后端的那一下就把服务拉起来。等服务收到第一条消息才拉，那一轮必然超时落兜底，
+    // 冷启动又要几十秒，用户会以为插件没生效。
+    if (live().judgeSource === 'local' && judge.state !== 'up') requestJudgeStart()
+    return { ok: true, persisted: true }
+  }
+
+  /** 设置页要显示的内容。 */
+  const readConfig = () => {
+    let writable = false
+    try {
+      const settings = ctx.get('settings')
+      writable = settings !== undefined && settings !== null && typeof settings.update === 'function'
+        && liveSettings(ctx, entryId) !== undefined
+    } catch {
+      writable = false
+    }
+    return { entryId, ...live(), writable }
+  }
+
+  // 浏览器半边的数据面：九条路由，两条前缀。旧前缀 /router-effort/* 是 README 与已有脚本里
+  // 的 curl 用的，一直留着。
   ctx.inject(['webServer'], (scoped) => {
     const webServer = scoped.get('webServer')
     if (webServer === undefined || webServer === null) {
       trace('webServer 不可用，模式开关没注册')
       return
     }
-    trace('webServer 就绪，注册 9 组 /effort-router/* 路由（含 /router-effort/* 旧别名）')
-    /**
-     * 读 JSON 请求体。
-     *
-     * 强制 `application/json`：插件路由不受宿主 auth fence 保护，浏览器里任意页面都能向
-     * localhost 发 no-cors 的 text/plain POST。要求 JSON 类型会让跨站请求触发预检而失败，
-     * 顺手挡掉配置被跨站改写的路径。
-     */
-    const collectJson = (req, send, onBody) => {
-      const headers = req !== null && typeof req === 'object' && req.headers !== undefined ? req.headers : {}
-      const contentType = String(headers['content-type'] ?? '').toLowerCase()
-      if (!contentType.includes('application/json')) {
-        send(415, { error: 'content-type must be application/json' })
-        return
+    const routes = createRoutes({
+      live, judge, recent, clientSeen, readConfig, writeConfig,
+      effortsFor, pickForTier, probeBackend, keyStatus, saveKey, openCredentials,
+      bareSession, trace,
+      limits: { modelInfoTtlMs: toMs(cfg.modelInfoTtlMs, 60000), setupLogPath: SETUP_LOG_PATH },
+      enums: { modes: MODES, judgeSources: JUDGE_SOURCES, tierKeys: TIER_KEYS },
+    })
+    trace('webServer 就绪，注册 ' + routes.length + ' 组 /effort-router/* 路由（含 /router-effort/* 旧别名）')
+    for (const route of routes) {
+      for (const prefix of ROUTE_PREFIXES) {
+        scoped.effect(() => webServer.register({ kind: 'exact', path: prefix + '/' + route.name, handler: route.handler }))
       }
-      let raw = ''
-      req.on('data', (chunk) => {
-        raw += chunk
-        if (Buffer.byteLength(raw) > 8192) req.destroy()
-      })
-      req.on('end', () => {
-        let body
-        try {
-          body = JSON.parse(raw)
-        } catch {
-          send(400, { error: 'body must be json' })
-          return
-        }
-        if (body === null || typeof body !== 'object') {
-          send(400, { error: 'body must be a json object' })
-          return
-        }
-        void onBody(body)
-      })
-    }
-
-    /**
-     * 把改动写回 profile。这是设置页保存的唯一落盘路径；没有设置面时退回内存开关。
-     *
-     * 失败分两类：字段本身不合法回 400，设置服务写不进去回 503。两者都带 detail。
-     */
-    const writeConfig = async (patch) => {
-      const invalid = (detail) => ({ ok: false, invalid: true, detail })
-      const clean = {}
-      if (typeof patch.enabled === 'boolean') clean.enabled = patch.enabled
-      if (MODES.includes(patch.mode)) clean.mode = patch.mode
-      if (JUDGE_SOURCES.includes(patch.judgeSource)) clean.judgeSource = patch.judgeSource
-      if (typeof patch.judgeUrl === 'string' && patch.judgeUrl !== '') {
-        // 判定地址每轮都会收到用户原文，必须限定成 http(s)，别的 scheme 一律拒绝。
-        let parsed
-        try {
-          parsed = new URL(patch.judgeUrl)
-        } catch {
-          parsed = undefined
-        }
-        if (parsed === undefined || (parsed.protocol !== 'http:' && parsed.protocol !== 'https:')) {
-          return invalid('judgeUrl 必须是 http(s) 地址')
-        }
-        clean.judgeUrl = parsed.toString()
-      }
-      if (typeof patch.legacyOwned === 'boolean') clean.legacyOwned = patch.legacyOwned
-      if (patch.notify === '' || patch.notify === 'off' || patch.notify === 'always') clean.notify = patch.notify
-      if (typeof patch.jevUrl === 'string' && patch.jevUrl !== '') {
-        let parsed
-        try {
-          parsed = new URL(patch.jevUrl)
-        } catch {
-          parsed = undefined
-        }
-        if (parsed === undefined || (parsed.protocol !== 'http:' && parsed.protocol !== 'https:')) {
-          return invalid('jevUrl 必须是 http(s) 地址')
-        }
-        clean.jevUrl = parsed.toString()
-      }
-      if (typeof patch.jevModel === 'string' && patch.jevModel !== '') clean.jevModel = patch.jevModel
-      if (typeof patch.jevApiKeyEnv === 'string' && patch.jevApiKeyEnv !== '') {
-        if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(patch.jevApiKeyEnv)) {
-          return invalid('凭据名只能包含字母、数字、下划线，且不能以数字开头')
-        }
-        clean.jevApiKeyEnv = patch.jevApiKeyEnv
-      }
-      if (patch.jevConfidence !== undefined && patch.jevConfidence !== null) {
-        const value = Number(patch.jevConfidence)
-        if (!Number.isFinite(value) || value < 0 || value > 1) {
-          return invalid('jevConfidence 必须在 0 到 1 之间')
-        }
-        clean.jevConfidence = value
-      }
-      if (patch.tiers !== undefined && patch.tiers !== null && typeof patch.tiers === 'object') {
-        const next = {}
-        for (const key of TIER_KEYS) {
-          const value = patch.tiers[key]
-          if (value === undefined) continue
-          if (typeof value !== 'string' || strengthOf(value) === undefined) {
-            return invalid(`档位 ${key} 的强度名不认识：${String(value)}`)
-          }
-          next[key] = value
-        }
-        if (Object.keys(next).length > 0) clean.tiers = next
-      }
-      if (Object.keys(clean).length === 0) return invalid('没有可写的字段')
-      let settings
-      try {
-        settings = ctx.get('settings')
-      } catch {
-        settings = undefined
-      }
-      if (settings === undefined || settings === null || typeof settings.update !== 'function') {
-        if (clean.mode === undefined) return { ok: false, detail: '设置服务不可用' }
-        mode.current = clean.mode
-        return { ok: true, persisted: false, detail: '设置服务不可用，只改了内存里的模式' }
-      }
-      try {
-        await settings.update(entryId, clean)
-      } catch (error) {
-        return { ok: false, detail: error && error.message ? error.message : String(error) }
-      }
-      if (clean.mode !== undefined) mode.current = clean.mode
-      // 切到本地后端的那一下就把服务拉起来。等服务收到第一条消息才拉，那一轮必然超时落兜底，
-      // 冷启动又要几十秒，用户会以为插件没生效。
-      if (live().judgeSource === 'local' && judge.state !== 'up') requestJudgeStart()
-      return { ok: true, persisted: true }
-    }
-
-    /** 设置页要显示的内容。 */
-    const readConfig = () => {
-      let writable = false
-      try {
-        const settings = ctx.get('settings')
-        writable = settings !== undefined && settings !== null && typeof settings.update === 'function'
-          && liveSettings(ctx, entryId) !== undefined
-      } catch {
-        writable = false
-      }
-      return { entryId, ...live(), writable }
-    }
-
-    const judgeHandler = (req, res) => {
-      if (req.method !== 'GET') {
-        res.statusCode = 405
-        res.end()
-        return
-      }
-      const now = live()
-      const jev = now.judgeSource === 'jev'
-      const text = JSON.stringify({
-        backend: now.judgeSource,
-        state: judge.state,
-        detail: judge.detail,
-        judgeUrl: jev ? now.jevUrl : now.judgeUrl,
-        ...(jev ? { jevModel: now.jevModel } : { setupLog: SETUP_LOG_PATH }),
-      })
-      res.statusCode = 200
-      res.setHeader('Content-Type', 'application/json; charset=utf-8')
-      res.setHeader('Content-Length', String(Buffer.byteLength(text)))
-      res.end(text)
-    }
-    const modeHandler = (req, res) => {
-      const send = (code, body) => {
-        const text = JSON.stringify(body)
-        res.statusCode = code
-        res.setHeader('Content-Type', 'application/json; charset=utf-8')
-        res.setHeader('Content-Length', String(Buffer.byteLength(text)))
-        res.end(text)
-      }
-      if (req.method === 'GET') {
-        send(200, { mode: live().mode })
-        return
-      }
-      if (req.method !== 'POST') {
-        send(405, { error: 'method not allowed' })
-        return
-      }
-      collectJson(req, send, async (body) => {
-        if (!MODES.includes(body.mode)) {
-          send(400, { error: 'mode must be auto or manual' })
-          return
-        }
-        const outcome = await writeConfig({ mode: body.mode })
-        if (!outcome.ok) {
-          send(outcome.invalid === true ? 400 : 503, outcome)
-          return
-        }
-        send(200, { mode: live().mode, persisted: outcome.persisted === true })
-      })
-    }
-    /** 诊断用：问出某个 provider/model 现在解析到的档位，用来确认新加的模型被读到了。 */
-    const modelsHandler = (req, res) => {
-      const send = (code, body) => {
-        const text = JSON.stringify(body)
-        res.statusCode = code
-        res.setHeader('Content-Type', 'application/json; charset=utf-8')
-        res.setHeader('Content-Length', String(Buffer.byteLength(text)))
-        res.end(text)
-      }
-      if (req.method !== 'GET') {
-        send(405, { error: 'method not allowed' })
-        return
-      }
-      let provider = ''
-      let model = ''
-      let tier = ''
-      try {
-        const query = new URL(typeof req.url === 'string' ? req.url : '/', 'http://127.0.0.1').searchParams
-        provider = query.get('provider') || ''
-        model = query.get('model') || ''
-        tier = (query.get('tier') || '').toLowerCase()
-        if (!TIER_KEYS.includes(tier)) tier = ''
-      } catch {
-        provider = ''
-        model = ''
-        tier = ''
-      }
-      if (provider === '' || model === '' || provider.length > MAX_QUERY_LENGTH || model.length > MAX_QUERY_LENGTH) {
-        send(400, { error: 'provider and model are required, at most 200 characters each' })
-        return
-      }
-      void (async () => {
-        try {
-          const efforts = await effortsFor(provider, model)
-          let picked
-          try {
-            picked = tier === '' ? undefined : pickForTier(efforts, tier, live().tiers)
-          } catch {
-            picked = undefined
-          }
-          send(200, {
-            provider,
-            model,
-            efforts,
-            // 带上 tier 时回这个档位实际会写成什么强度，方便核对位置映射。
-            ...(tier === '' ? {} : { tier, picked }),
-            ttlMs: toMs(cfg.modelInfoTtlMs, 60000),
-          })
-        } catch (error) {
-          send(500, { error: error && error.message ? error.message : String(error) })
-        }
-      })()
-    }
-    /** 输入框旁的芯片读这里：每个会话最近一次判定。 */
-    const lastHandler = (req, res) => {
-      const send = (code, body) => {
-        const text = JSON.stringify(body)
-        res.statusCode = code
-        res.setHeader('Content-Type', 'application/json; charset=utf-8')
-        res.setHeader('Content-Length', String(Buffer.byteLength(text)))
-        res.end(text)
-      }
-      if (req.method !== 'GET') {
-        send(405, { error: 'method not allowed' })
-        return
-      }
-      let session = ''
-      try {
-        session = new URL(typeof req.url === 'string' ? req.url : '/', 'http://127.0.0.1').searchParams.get('session') || ''
-      } catch {
-        session = ''
-      }
-      if (session.length > MAX_QUERY_LENGTH) session = ''
-      const all = [...recent.entries()]
-        .map(([key, value]) => ({ session: key, ...value }))
-        .sort((left, right) => right.at - left.at)
-      // 展示只取前 20 条，但“当前会话”在完整列表里找，免得命中被截掉。
-      const records = all.slice(0, 20)
-      clientSeen.lastQuery = session === '' ? null : session
-      const wanted = bareSession(session)
-      const current = wanted === ''
-        ? undefined
-        : all.find((row) => bareSession(row.session) === wanted)
-      send(200, {
-        records,
-        current: current === undefined ? null : current,
-        // 开关关掉时芯片整个不出现：宿主把状态一起发过去，前端轮询一次就能决定。
-        enabled: live().enabled,
-        seenAt: clientSeen.at,
-        lastQuery: clientSeen.lastQuery,
-        propsKeys: clientSeen.keys,
-        propsSid: clientSeen.sid,
-      })
-    }
-    /** 浏览器半边的报到点：有值就说明 client bundle 在页面里跑过。 */
-    const seenHandler = (req, res) => {
-      if (req.method !== 'GET' && req.method !== 'HEAD') {
-        res.statusCode = 405
-        res.end()
-        return
-      }
-      let keys = ''
-      let sid = ''
-      try {
-        const query = new URL(typeof req.url === 'string' ? req.url : '/', 'http://127.0.0.1').searchParams
-        keys = (query.get('keys') || '').slice(0, MAX_QUERY_LENGTH)
-        sid = (query.get('sid') || '').slice(0, MAX_QUERY_LENGTH)
-      } catch {
-        keys = ''
-        sid = ''
-      }
-      clientSeen.at = Date.now()
-      if (keys !== '') clientSeen.keys = keys
-      if (sid !== '') clientSeen.sid = sid
-      const text = JSON.stringify({ ok: true, at: clientSeen.at, keys: clientSeen.keys ?? null, sid: clientSeen.sid ?? null })
-      res.statusCode = 200
-      res.setHeader('Content-Type', 'application/json; charset=utf-8')
-      res.setHeader('Content-Length', String(Buffer.byteLength(text)))
-      res.end(text)
-    }
-    const configHandler = (req, res) => {
-      const send = (code, body) => {
-        const text = JSON.stringify(body)
-        res.statusCode = code
-        res.setHeader('Content-Type', 'application/json; charset=utf-8')
-        res.setHeader('Content-Length', String(Buffer.byteLength(text)))
-        res.end(text)
-      }
-      if (req.method === 'GET') {
-        send(200, readConfig())
-        return
-      }
-      if (req.method !== 'POST') {
-        send(405, { error: 'method not allowed' })
-        return
-      }
-      collectJson(req, send, async (body) => {
-        const outcome = await writeConfig(body)
-        if (!outcome.ok) {
-          send(outcome.invalid === true ? 400 : 503, outcome)
-          return
-        }
-        send(200, { ok: true, persisted: outcome.persisted === true, config: readConfig() })
-      })
-    }
-    /**
-     * 同源检查：探活、写 Key、开文件这类动作只接受本页发起的请求。
-     * 跨站页面即使能发 JSON，也过不了这一关；curl 之类不带这些头的不受影响。
-     */
-    const sameOrigin = (req) => {
-      const headers = req !== null && typeof req === 'object' && req.headers !== undefined ? req.headers : {}
-      const site = String(headers['sec-fetch-site'] ?? '')
-      if (site !== '' && site !== 'same-origin' && site !== 'none') return false
-      const origin = String(headers.origin ?? '')
-      if (origin === '') return true
-      try {
-        return new URL(origin).host === String(headers.host ?? '')
-      } catch {
-        return false
-      }
-    }
-    const probeHandler = (req, res) => {
-      const send = (code, body) => {
-        const text = JSON.stringify(body)
-        res.statusCode = code
-        res.setHeader('Content-Type', 'application/json; charset=utf-8')
-        res.setHeader('Content-Length', String(Buffer.byteLength(text)))
-        res.end(text)
-      }
-      if (req.method !== 'POST') {
-        send(405, { error: 'method not allowed' })
-        return
-      }
-      if (!sameOrigin(req)) {
-        send(403, { ok: false, detail: '只接受本页发起的探活' })
-        return
-      }
-      collectJson(req, send, async (body) => {
-        const now = live()
-        const wanted = { ...now }
-        // 只允许切换后端与模型名：地址一律用已保存的。
-        // 否则任何页面都能借这个接口把 Bearer 凭据发到它自己指定的 URL。
-        if (JUDGE_SOURCES.includes(body.judgeSource)) wanted.judgeSource = body.judgeSource
-        if (typeof body.jevModel === 'string' && body.jevModel !== '') wanted.jevModel = body.jevModel
-        // 地址守卫只比当前后端那一条，且按规范化后的 URL 比：
-        // 换个大小写、补个默认端口都还是同一个地址，不该拦；另一条地址改没改与本次测试无关。
-        const sameUrl = (left, right) => {
-          try {
-            return new URL(left).toString() === new URL(right).toString()
-          } catch {
-            return false
-          }
-        }
-        if (wanted.judgeSource === 'local' && typeof body.judgeUrl === 'string' && body.judgeUrl !== ''
-          && !sameUrl(body.judgeUrl, now.judgeUrl)) {
-          send(200, { ok: false, backend: 'local', detail: '地址改过还没保存，先保存再测试', ms: 0 })
-          return
-        }
-        if (wanted.judgeSource === 'jev' && typeof body.jevUrl === 'string' && body.jevUrl !== ''
-          && !sameUrl(body.jevUrl, now.jevUrl)) {
-          send(200, { ok: false, backend: 'jev', detail: '地址改过还没保存，先保存再测试', ms: 0 })
-          return
-        }
-        send(200, await probeBackend(wanted))
-      })
-    }
-    /** Key：GET 报状态（不含值），POST 写进凭据库。 */
-    const keyHandler = (req, res) => {
-      const send = (code, body) => {
-        const text = JSON.stringify(body)
-        res.statusCode = code
-        res.setHeader('Content-Type', 'application/json; charset=utf-8')
-        res.setHeader('Content-Length', String(Buffer.byteLength(text)))
-        res.end(text)
-      }
-      if (req.method === 'GET') {
-        void keyStatus(live()).then((status) => send(200, status))
-        return
-      }
-      if (req.method !== 'POST') {
-        send(405, { error: 'method not allowed' })
-        return
-      }
-      if (!sameOrigin(req)) {
-        send(403, { ok: false, detail: '只接受本页发起的写入' })
-        return
-      }
-      collectJson(req, send, async (body) => {
-        const value = typeof body.key === 'string' ? body.key.trim() : ''
-        if (value === '') {
-          send(400, { ok: false, detail: 'Key 不能为空' })
-          return
-        }
-        if (value.length > 4096) {
-          send(400, { ok: false, detail: 'Key 太长，不像是有效值' })
-          return
-        }
-        const outcome = await saveKey(live(), value)
-        if (!outcome.ok) {
-          send(outcome.code ?? 503, { ok: false, detail: outcome.detail })
-          return
-        }
-        send(200, { ok: true, ...(await keyStatus(live())) })
-      })
-    }
-    /** 用系统默认程序打开凭据文件。路径固定在凭据文件上，不接受调用方传入。 */
-    const openCredentialsHandler = (req, res) => {
-      const send = (code, body) => {
-        const text = JSON.stringify(body)
-        res.statusCode = code
-        res.setHeader('Content-Type', 'application/json; charset=utf-8')
-        res.setHeader('Content-Length', String(Buffer.byteLength(text)))
-        res.end(text)
-      }
-      if (req.method !== 'POST') {
-        send(405, { error: 'method not allowed' })
-        return
-      }
-      if (!sameOrigin(req)) {
-        send(403, { ok: false, detail: '只接受本页发起的打开请求' })
-        return
-      }
-      const outcome = openCredentials()
-      if (!outcome.ok) {
-        send(outcome.code ?? 503, { ok: false, detail: outcome.detail })
-        return
-      }
-      trace(`打开凭据文件：${outcome.path}`)
-      send(200, { ok: true, path: outcome.path })
-    }
-    for (const path of ['/effort-router/judge', '/router-effort/judge']) {
-      scoped.effect(() => webServer.register({ kind: 'exact', path, handler: judgeHandler }))
-    }
-    for (const path of ['/effort-router/mode', '/router-effort/mode']) {
-      scoped.effect(() => webServer.register({ kind: 'exact', path, handler: modeHandler }))
-    }
-    for (const path of ['/effort-router/config', '/router-effort/config']) {
-      scoped.effect(() => webServer.register({ kind: 'exact', path, handler: configHandler }))
-    }
-    for (const path of ['/effort-router/models', '/router-effort/models']) {
-      scoped.effect(() => webServer.register({ kind: 'exact', path, handler: modelsHandler }))
-    }
-    for (const path of ['/effort-router/last', '/router-effort/last']) {
-      scoped.effect(() => webServer.register({ kind: 'exact', path, handler: lastHandler }))
-    }
-    for (const path of ['/effort-router/seen', '/router-effort/seen']) {
-      scoped.effect(() => webServer.register({ kind: 'exact', path, handler: seenHandler }))
-    }
-    for (const path of ['/effort-router/probe', '/router-effort/probe']) {
-      scoped.effect(() => webServer.register({ kind: 'exact', path, handler: probeHandler }))
-    }
-    for (const path of ['/effort-router/key', '/router-effort/key']) {
-      scoped.effect(() => webServer.register({ kind: 'exact', path, handler: keyHandler }))
-    }
-    for (const path of ['/effort-router/open-credentials', '/router-effort/open-credentials']) {
-      scoped.effect(() => webServer.register({ kind: 'exact', path, handler: openCredentialsHandler }))
     }
   })
 }
