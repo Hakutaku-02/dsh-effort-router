@@ -111,8 +111,13 @@ export const Config = z.object({
   jevApiKeyEnv: z.string().default(JEV_KEY_REF).volatile(),
   jevConfidence: z.number().default(DEFAULT_JEV_CONFIDENCE).volatile(),
   jevTimeoutMs: z.number().default(JEV_TIMEOUT_MS),
-  /** 判定预算。判定跑在 hold 里，这个值直接决定首 token 晚到多久。 */
-  judgeTimeoutMs: z.number().default(JUDGE_HOLD_TIMEOUT_MS).volatile(),
+  /**
+   * 判定预算。判定跑在 hold 里，这个值直接决定首 token 晚到多久。
+   *
+   * 这里不给 default：schema 默认值会被写进 describe() 的 value，按后端区分的默认预算
+   * 就永远轮不到（以前本地 1200 会盖掉 Jev 的 3000）。留空由 live() 按后端决定。
+   */
+  judgeTimeoutMs: z.number().volatile(),
   notify: z.string().default('').volatile(),
   tiers: z.dict(z.string()).volatile(),
   autoStart: z.boolean(),

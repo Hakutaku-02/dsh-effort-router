@@ -161,6 +161,21 @@ async function effortOf(ctx, id, options = {}) {
   check('Jev: 不可达落兜底', await effortOf(ctx, 'session-jev-down'), 'low')
 }
 
+// 没配 judgeTimeoutMs 时按后端给预算：jev 3000，local 1200
+// （schema 带上 default 的话，describe().value 里会先出现那个默认值，按后端区分的逻辑就失效）
+{
+  const ctx = fresh({ jevUrl })
+  const status = await callRoute(ctx, '/effort-router/config', undefined, { method: 'GET', headers: {} })
+  check('预算: jev 默认 3000', status.body.judgeTimeoutMs, 3000)
+  const local = makeContext({ settings: { judgeSource: 'local', judgeUrl: 'http://127.0.0.1:1/judge' } })
+  apply(local, { mode: 'auto', startupWaitMs: 0, provision: false })
+  const localStatus = await callRoute(local, '/effort-router/config', undefined, { method: 'GET', headers: {} })
+  check('预算: local 默认 1200', localStatus.body.judgeTimeoutMs, 1200)
+  const pinned = fresh({ jevUrl, judgeTimeoutMs: 2000 })
+  const pinnedStatus = await callRoute(pinned, '/effort-router/config', undefined, { method: 'GET', headers: {} })
+  check('预算: 配了就按配的', pinnedStatus.body.judgeTimeoutMs, 2000)
+}
+
 // 用 jev 时不该去探本地判定服务：探活与部署都是白做，状态还会显示成「部署失败」
 {
   const ctx = fresh({ jevUrl })
