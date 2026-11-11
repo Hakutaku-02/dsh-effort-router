@@ -10,328 +10,253 @@
 </p>
 
 <p align="center">
-每轮按任务难度自动选择思考强度，<code>provider</code> 和 <code>model</code> 保持你在模型选择器里的选择。<br>
+按任务难度自动匹配当前模型的思考强度，保持 Provider 与模型选择不变。<br>
 <sub>Per-turn reasoning effort routing for DeepSeek Harness.</sub>
 </p>
 
 ## 它做什么
 
-你按下发送后，插件把这轮的文本交给判定源，换回一个档位：`low`、`high`、`max`。档位按当前模型在 Provider 里声明的强度列表落位，写进本轮请求的 `reasoningEffort`。
+用户发送消息后，插件抓取当轮文本判定难度，输出 `low`、`high`、`max` 三个档位。
 
-判定在请求发出之前跑完，所以本轮第一个请求就带着新强度。
+档位按当前模型在 Provider 中声明的思考强度列表（按位置）落位，并写入当轮请求的 `reasoningEffort`。
 
-判定源不可用、超出预算、或者目标模型没有声明强度时，插件落一个兜底档（该会话上一轮的档位，没有就用 `tiers.fallback`），请求照常发出。
+**时序保障**：在 DSH 0.2.2 时序下，消息进入 inbox 时触发 `agent/inbox/inserted` 事件。插件通过 `agent.runMaintenance` 挂起唤醒并执行异步判定，调用 `agent.model.select()` 写入配置。放开唤醒后，首个请求直接携带计算出的思考强度。
+
+**兜底机制**：判定超时、服务异常或目标模型未声明强度时，自动采用兜底档位（优先使用会话上一轮档位，若无则使用 `tiers.fallback`），保障会话流程顺畅发出。
+
+**手动下限**：用户在模型选择器中手动设定的强度作为保护下限，自动判定只提升不降低。
 
 ## 为什么需要它
 
-同一个模型，问一句“今天几号”和让它重构三个文件，值得花的思考预算不一样。手动去模型选择器里调，容易忘记调回来，换个模型又要重新试。
+不同任务对思考深度的需求差异巨大。简单问答需要快速响应，复杂工程任务需要深度推理。
 
-这个插件把这一步放进每轮请求：难度判一次，强度自动落位，档位变化在输入框旁边就能看到。
+手动调节存在明显成本：
+- 频繁打开模型选择器切换等级容易遗忘还原。
+- 各厂商模型的档位命名不一致（3 档、5 档模型共存），切换模型时需要重新确认。
+
+该插件将判定自动化并下沉至请求生命周期，兼顾交互响应与深度推理。
 
 ## 核心能力
 
-- 每轮判一次，判的是这一轮的用户消息。
-- `provider` 和 `model` 用模型选择器里的那个，换厂商不用改插件。
-- 档位按模型声明的强度列表按位置落位，各厂商的档位都能用满。
-- 判定源可选：本机 Python 判定服务，或 Jev 的 System One 决策端点。选本机时插件自己拉起服务，在设置页切过来也不用重启。
-- 输入框右侧的芯片显示上一轮与这一轮的档位，悬停能看到最终强度与模型名。
-- 判定结果落盘到 `~/.dsh/router-effort/last.json`，重启 DSH 后芯片仍有内容。
-- 你在模型选择器里手动调过强度时，判定结果只往上抬，比你的选择弱就保留你的选择。
-- 落盘记录里带着写之前的强度与判定落位值，升级后老会话不会被继承的强度永久卡住。
+- **单轮独立判定**：依据当前轮次的用户输入文本计算难度。
+- **锁定模型配置**：保持用户选择的 Provider 与模型不变，仅调节思考强度。
+- **位置自适应落位**：按目标模型声明的强度列表进行位置索引，适配各厂商模型。
+- **双判定后端支持**：支持本地 CPU 微调模型与云端 Jev (System One) 决策协议。
+- **守护进程自动看管**：本地服务由 `supervisor.mjs` 监控，随 DSH 退出自动释放端口与内存。
+- **输入框状态芯片**：在输入框右侧直观展示上一轮与本轮档位变化，悬停查看具体数值。
+- **手动设置下限保护**：用户手动指定的强度作为基准，判定结果只升不降。
+- **状态本地持久化**：判定记录保存至本地文件，重启应用保持状态连贯。
 
 ## 工作流程
 
 ```mermaid
 flowchart TD
-  A["用户消息进 inbox"] --> B["agent/inbox/inserted：扣住本轮唤醒"]
-  B --> C{"judgeSource"}
-  C -->|local| L{"服务在线？"}
-  L -->|否| M["按 servicePython/Script/Model 拉起，冷启动约 60 秒"]
-  L -->|是| D["本机判定服务（发全文，2 到 13 秒）"]
-  M -.->|这一轮| G
-  C -->|jev| E["Jev 决策端点"]
-  D --> F["档位 low / high / max"]
+  A["用户消息进入 inbox"] --> B["agent/inbox/inserted：扣住唤醒 (runMaintenance)"]
+  B --> C{"判定后端选择"}
+  C -->|local| D["本地判定服务 (8765 端口)"]
+  C -->|jev| E["Jev 决策端点 (System One)"]
+  D --> F{"判定结果"}
   E --> F
-  C -.->|失败或超预算| G["兜底档：上一轮档位 / tiers.fallback"]
-  F --> H["按当前模型声明的强度落位"]
-  G --> H
-  H --> I["agent.model.select 写进会话选择"]
-  I --> J["放开唤醒：pre-step 插提示，请求带着强度发出"]
+  F -->|成功| G["输出档位 low / high / max"]
+  F -->|超时或异常| H["兜底档位 (上一轮档位 / tiers.fallback)"]
+  G --> I["按目标模型强度列表按位置落位"]
+  H --> I
+  I --> J["agent.model.select() 写入会话选择"]
+  J --> K["放开唤醒：请求从首步携带目标 reasoningEffort"]
 ```
 
-DSH 0.2.2 的时序决定了写入点：
+DSH 0.2.2 执行时序：
 
 ```
-send() → splice → agent/inbox/inserted（同步）→ runMaintenance 扣住唤醒
-                                                       ↓ 判定 + model.select
+send() → splice → agent/inbox/inserted (同步) → runMaintenance 扣住唤醒
+                                                      ↓ 异步判定 + model.select
 放开唤醒 → wakeDriver → inbox.claim → model.current() 快照 → agent/pre-step → 请求
 ```
 
-`model.current()` 的快照发生在 `pre-step` 派发之前。写在 `pre-step` 里的强度只影响下一步，所以判定放在 `inserted` 里跑，用 `runMaintenance` 把唤醒扣到写完为止。
+`model.current()` 快照在 `pre-step` 派发前生成。插件在 `agent/inbox/inserted` 中通过 `runMaintenance` 挂起唤醒，完成判定与写入后再释放，确保本轮首个请求即携带新配置。
 
-## 首 token 延迟
+## 快速开始
 
-判定跑在 hold 里，这段等待直接落在本轮首 token 上。
+运行环境要求：Node.js >= 18，DSH >= 0.2.2-rc.1，Peer 依赖 `@deepseek-ai/schemastery`。
 
-Jev 端点（4000 字符任务文本、真实 criteria，20 次成功样本）：
+### GUI 安装
 
-| 口径 | p50 | p90 | max |
-| --- | --- | --- | --- |
-| 真实请求体（20 次） | 964ms | 1371ms | 1737ms |
-| 全部成功样本（50 次） | 964ms | 1591ms | 2416ms |
+1. 打开 DSH 设置中的「插件管理」。
+2. 在安装框输入：
+   ```
+   github:Hakutaku-02/dsh-effort-router
+   ```
+3. 安装完成后重启 DSH。插件自带的 `cordis.patch.yml` 会自动挂载配置。
 
-本机判定服务（846MB CPU 微调模型，2026-11-10 实测）：
-
-| 输入 | 耗时 |
-| --- | --- |
-| 规则快路径（多段落规格、日志粘贴这类） | 7 到 45ms |
-| 常见提问（36 到 87 字） | p50 2.9 秒，p90 4.3 秒 |
-| 120 到 180 字 | 5 到 7 秒 |
-| 400 字以上 | 12 到 13 秒（饱和线） |
-
-所以预算按后端分：Jev 3000ms，本地 6000ms，两者都能用 `judgeTimeoutMs` 改。6000ms 覆盖常见提问；更长的文本落兜底档，这一轮多等的就是预算那么多。本地服务冷启动还要单独加载一次权重，约 60 秒，这段时间那几个请求照常发出、落兜底档。
-
-判定输入两个后端都发全文（最多 4000 字）。截断会改判定结果：同一段多段落规格，全文判 `low` 用 45ms，截到前 150 字判 `max` 用 6.9 秒。
-
-超出预算时按兜底档放行，这一轮多等的就是预算那么多。
-
-## 安装
-
-运行环境：Node.js 18 以上，DSH 0.2.2-rc.1 以上。
-
-### GUI
-
-设置里的插件管理，安装框填：
-
-```
-github:Hakutaku-02/dsh-effort-router
-```
-
-装完重启 DSH。包里的 `cordis.patch.yml` 在启动时插入配置行，装完即启用。
-
-### 命令行
+### CLI 安装
 
 ```bash
 dsh plugin --profile web install github:Hakutaku-02/dsh-effort-router
 ```
 
-`--profile` 必填。`desktop` profile 由 Electron 应用独占，桌面端只能用 GUI 安装。
+> `desktop` profile 由桌面端独占，桌面端请通过 GUI 完成安装。
 
-### 判定服务
+## 视觉与体验
 
-`judgeSource` 为 `local` 时才需要本机判定服务。三条配置把服务交给插件管：
+### 输入框芯片
 
-| 字段 | 填什么 |
-| --- | --- |
-| `servicePython` | 装好 torch 的解释器，例如 `E:\AIPack\DSH-laya\venv\Scripts\python.exe` |
-| `serviceScript` | `laya_router.py` 的路径，例如 `<包目录>/service/laya_router.py`，或用镜像目录 `~/.dsh/router-effort/laya/service/laya_router.py` |
-| `serviceModel` | 权重目录，拉起时作为 `LAYA_MODEL` 传给服务 |
+输入框右侧包含状态芯片：
+- 尚无判定记录时，显示 `Default`。
+- 完成判定后，显示状态变化（例如 `high → high` 或 `low → high`）。
+- 鼠标悬停可查看当前档位、最终落位强度及目标模型名称。
+- 在设置中关闭路由总开关后，芯片自动隐藏。
 
-三个都填对，插件在启动时（`judgeSource` 已经是 `local`）、用户切到「本地」的那一次保存、以及判定时发现服务不在线，都会把服务拉起来。保存时拉起是为了别把冷启动压在第一条消息上：那 60 秒里发出去的每轮都只能落兜底档。
+### 设置面板
 
-```bash
-python <laya_router.py> --http --port 8765     # 环境变量 LAYA_MODEL=<serviceModel>
-```
+设置导航中的「思考强度」与插件配置页均可管理配置：
+- 基础控制：路由总开关、模式切换（自动 / 手动）、判定后端切换。
+- Jev 配置：端点地址、模型名称、API Key 录入、置信度阈值。
+- 本地配置：本地判定服务地址。
+- 辅助功能：即时测试探活、档位映射自定义。
 
-> `serviceModel` 指到权重目录。空着时服务去 `<包目录>/weights/model` 找权重，找不到就退成基座协议：`/health` 报 `protocol=base`，`/judge` 不带 `tier`，插件两头都用不了。
+## 档位落位机制
 
-服务拉起后约 60 秒完成权重加载，状态从 `starting` 转 `up`。这期间请求照常发出，落兜底档。
+判定后端固定输出三档：`low`、`high`、`max`。
 
-判定服务不直接挂在 DSH 下面，而是由 `supervisor.mjs` 看管：它每秒看一次 DSH 的 pid，DSH 退出或被强行结束后，用 `taskkill /T` 把 python 整棵进程树结束掉，然后自己退出。所以关掉 DSH，端口 8765 和那份权重占的内存会一起放掉，不需要手工清理。
+插件提取当前模型支持的思考强度列表，按位置索引进行落位：`low` 取首档，`high` 取中位档，`max` 取末档。
 
-看门人启动时在 `~/.dsh/router-effort/service.pid` 写下自己的 pid，正常退出时删掉。服务在线但这条记录缺失、或者记录里的看门人已经不在时，`/effort-router/judge` 的 `detail` 会写明「服务在线但不在看门人管下（旧版遗留或手工启动），退出 DSH 后它不会自己结束」。判断看管状态时先看本进程拉起过的看门人（子进程对象），pid 探测只用于跨进程兜底，因为 pid 会被系统复用。
-
-早于 0.4.3 的版本拉起的判定服务没人在看管，升级后它会一直占着端口（探活能通，插件就不会重复拉起）。升级那一次手工结束它：
-
-```bash
-netstat -ano | findstr :8765     # 记下 PID
-taskkill /PID <PID> /T /F
-```
-
-再重启 DSH，新的服务就归 `supervisor.mjs` 管了。
-
-想自己先把 venv 和权重备好（老部署、或者挪到别的盘）：
-
-```bash
-python -m venv .venv-router
-.venv-router/Scripts/python -m pip install -r service/requirements.lock.txt   # CPU 版 torch
-node weights/fetch.mjs                                                        # 846MB 权重到 weights/model
-```
-
-`provision` 为 `true` 时，服务起不来会退到 `dsh-router-laya` 自带的 `bin/setup.mjs` 做首次部署（建 venv、装 CPU 版 torch、下 846MB 权重）。这条路径目前有上游 bug：`setup.mjs` 建 venv 时读 `probe.base` 会抛 `TypeError: probe.base is not iterable`，日志在 `%TEMP%\router-effort-setup.log`。这条路不通时，按上面的手工步骤备好 venv 与权重，再把三条路径字段填上。
-
-`judgeSource` 为 `jev` 时不检查本机服务，也不部署。
-
-## 装好之后
-
-输入框右侧多出一个芯片。还没判定过时显示 `Default`；有记录后显示上一轮到这一轮，同档是 `high → high`，跨档是 `low → high`。悬停或读屏能看到 `当前档 → 强度（provider/model）`。
-
-设置里把「路由开关」关掉之后，芯片整个消失，请求也不再被改写。
-
-设置左侧导航多出一节「思考强度」，插件详情页里也有一份同样的配置，改哪边都一样。
-
-## 档位怎么落位
-
-判定只给三档，插件看当前模型自己声明了哪些强度，然后按位置取：`low` 取第一档，`high` 取中间档，`max` 取最后一档。
-
-| 模型 | 声明的强度 | 判定 low | 判定 high | 判定 max |
-| --- | --- | --- | --- | --- |
+| 目标模型示例 | 模型声明的强度列表 | 判定 low | 判定 high | 判定 max |
+| :--- | :--- | :--- | :--- | :--- |
 | deepseek-flash（tokenflux） | low / high / max | low | high | max |
 | MiniMax-M3.1-Flash（minimax-mplan） | low / medium / high / xhigh / max | low | high | max |
 | gemini-3.8-flash（tokenflux） | low / medium / high | low | medium | high |
 
-五档模型只落 low / high / max：中间档取的是梯子的中间那一格（`high`），`medium` 与 `xhigh` 不会被选中。三档模型（gemini）用满 low / medium / high。
+五档模型按中位映射至 `high`，三档模型对应落位至 `low` / `medium` / `high`。
 
-想手工指定落点就改 `tiers` 里 `low`、`high`、`max` 的强度名，只要其中之一与默认值不同，插件就按那张表按名字取。`tiers.fallback` 不参与这个判断，它只决定判定失败时用哪个档。
+如需固定强度名称，可在配置项 `tiers` 中单独定义 `low`、`high`、`max` 的具体名称。
 
-## 判定源
+## 判定源选择
 
-`judgeSource` 二选一。
+支持 `local` 与 `jev` 两种后端：
 
-**local** 走本机判定服务，默认地址 `http://127.0.0.1:8765/judge`。协议固定：`POST` 任务描述，返回 `{"tier":"low|high|max"}`；`GET /health` 返回 `{"protocol":"finetuned"}`。
+| 评估维度 | local（本地服务） | jev（云端决策） |
+| :--- | :--- | :--- |
+| 运行位置 | 本地 CPU 进程 | 云端 API 端点 |
+| 决策模型 | 约 846MB 微调模型（磁盘占用约 2GB） | TypeSafe System One (`jev-latest`) |
+| 协议规范 | HTTP POST 任务文本至 8765 端口 | System One 决策协议 (JSON) |
+| 默认端点 | `http://127.0.0.1:8765/judge` | `https://api.typesafe.ai/v1/systemone` |
+| 凭据配置 | 无需凭据 | 环境变量或凭据库 `TYPESAFE_API_KEY` |
+| 典型耗时 | 2 到 7 秒（长文本会有所增加） | 约 1 秒 |
+| 默认超时 | 6000ms | 3000ms |
+| 资源开销 | 约 2GB 磁盘与运行内存 | 无本地硬件开销 |
+| 隐私网络 | 离线计算，文本不离机 | 发送单轮任务文本至端点 |
+| 进程看管 | `supervisor.mjs` 看管，随 DSH 退出自动释放 | 无需本地进程管理 |
 
-**jev** 走 System One 决策端点，默认 `https://api.typesafe.ai/v1/systemone`。协议是 `{model, state, questions}` → `{answers:{effort:{choice, confidence, probabilities}}}`。Key 在设置页的 API Key 输入框里填，凭据引用名默认 `TYPESAFE_API_KEY`；先查宿主凭据库，再查进程环境变量；超时 12 秒。置信度低于 `jevConfidence` 时，在概率最高的两档里取更强的那个。
+### 本地服务看管说明
 
-Jev 的地址与 Key 要配套：`https://api.typesafe.ai/v1/systemone` 配 TypeSafe 发的 Key，`https://tokenflux.dev/v1/systemone` 配 TokenFlux 发的 Key。拿错会得到 401。
+本地服务由 `supervisor.mjs` 监控。DSH 退出时，看管进程会终止 Python 进程树，释放 8765 端口和内存占用。
 
-`jevModel` 只能填端点允许的模型名。`tokenflux.dev` 上是 `jev-latest` 与 `jev-preview`；填 `jev-1.14.0` 会被拒（403 `permission_error`），每轮白花一次往返。响应里的 `model` 字段会归一成 `jev-1.14.0`，档位判定不受影响。
-
-local 判定在本机完成，任务描述不出本机；jev 会把任务描述发给上面配置的端点。
-
-## 设置页
-
-| 区块 | 能改什么 |
-| --- | --- |
-| 路由开关 | 开启或关闭。关掉后不改请求，输入框旁的芯片也一起隐藏 |
-| 判定方式 | 本地服务或 Jev，选 Jev 时展开下面四项 |
-| Jev 配置 | 地址、模型名、API Key、置信度阈值。Key 存进凭据库，面板只显示已配置或未配置 |
-| 模式 | 自动或手动。手动时强度由你在模型选择器里定，与总开关叠加 |
-| 判定服务 | 本机判定服务的地址 |
-| 对话提示 | 变化时提示、每轮都提示、不提示 |
-| 档位映射 | 简单、中等、困难、兜底四个下拉 |
-
-页面行为：
-
-- 没有改动时「保存」是灰的，改动后才可点；只填 Key 不动其他字段也能保存。
-- 判定地址、Jev 地址、模型名必填。清空后保存只给提示，不发请求。
-- 置信度留空或超出 0 到 1 也不保存。
-- Key 输入框不回显已有值，留空表示不改。
-- 「测试」按表单里当前的判定源与模型名发一次最小请求，地址用已保存的值；改过地址要先保存再测。
-- 档位下拉只列真实档位，不含 `off`。
+## 配置项参考
 
 <details>
-<summary>配置字段与默认值</summary>
+<summary>展开配置项</summary>
 
-| 字段 | 默认值 | 作用 |
-| --- | --- | --- |
-| `enabled` | `true` | 总开关。`false` 时不改请求 |
-| `mode` | `auto` | `manual` 时不改请求，与总开关叠加 |
-| `judgeSource` | `local` | 判定后端，`local` 或 `jev` |
-| `judgeUrl` | `http://127.0.0.1:8765/judge` | 本机判定服务地址 |
-| `judgeTimeoutMs` | local `6000` / jev `3000` | 一次判定的预算，也是首 token 最多晚多久 |
-| `jevUrl` | `https://api.typesafe.ai/v1/systemone` | Jev 决策端点 |
-| `jevModel` | `jev-latest` | Jev 模型名 |
-| `jevApiKeyEnv` | `TYPESAFE_API_KEY` | 凭据引用名，面板保存 Key 时也写这里 |
-| `jevConfidence` | `0.6` | 置信度阈值 |
-| `jevTimeoutMs` | `12000` | 设置页「测试」按钮的 Jev 请求超时 |
-| `tiers` | `low/high/max` 同名映射，`fallback: low` | 档位到强度的映射 |
-| `notify` | `''`（变化时提示） | 提示频率 |
-| `legacyOwned` | `true` | 旧记录缺归属标记时的口径：`true` 按插件自己写的算，`false` 按用户手动设的下限算 |
-| `autoStart` | `true` | 发现本机判定服务不在线时按路径拉起 |
-| `servicePython` | 空 | 判定服务的 Python 路径 |
-| `serviceScript` | 空 | 判定服务的入口脚本 |
-| `serviceModel` | 空 | 权重目录，拉起时作为 `LAYA_MODEL` 传给服务 |
-| `provision` | `true` | 本机判定服务起不来时自动部署 |
-| `layaDir` | 空 | `dsh-router-laya` 包的位置 |
-| `startupWaitMs` | `3000` | 启动时等本机判定服务就绪的上限 |
-| `startWaitMs` | `90000` | 拉起后等就绪的上限，覆盖约 70 秒冷启动 |
-| `provisionWaitMs` | `5000` | 部署脚本跑完后等就绪的上限 |
-| `modelInfoTtlMs` | `60000` | 模型档位的缓存寿命 |
+| 配置项 | 默认值 | 作用说明 |
+| :--- | :--- | :--- |
+| `enabled` | `true` | 路由总开关。设置为 `false` 时不改写请求 |
+| `mode` | `auto` | 运行模式。`manual` 为手动模式，与总开关叠加 |
+| `judgeSource` | `local` | 判定后端，可选 `local` 或 `jev` |
+| `judgeUrl` | `http://127.0.0.1:8765/judge` | 本地判定服务地址 |
+| `judgeTimeoutMs` | local: `6000` / jev: `3000` | 单次判定超时上限（毫秒） |
+| `jevUrl` | `https://api.typesafe.ai/v1/systemone` | Jev 决策服务端点 |
+| `jevModel` | `jev-latest` | Jev 模型名称 |
+| `jevApiKeyEnv` | `TYPESAFE_API_KEY` | 凭据引用变量名 |
+| `jevConfidence` | `0.6` | 置信度阈值，低于该值在最高两档取更强者 |
+| `jevTimeoutMs` | `12000` | 设置页探活测试请求超时时间 |
+| `tiers` | `low/high/max` 同名映射，`fallback: low` | 档位到模型强度的映射表 |
+| `notify` | `""` | 对话提示频率（空字符串表示变化时提示） |
+| `legacyOwned` | `true` | 无归属标记历史记录的兼容策略 |
+| `autoStart` | `true` | 本地服务离线时自动按路径拉起 |
+| `servicePython` | `""` | 本地判定服务的 Python 解释器路径 |
+| `serviceScript` | `""` | 本地判定服务的入口脚本路径 |
+| `serviceModel` | `""` | 本地判定服务的模型权重目录路径 |
+| `provision` | `true` | 本地服务启动失败时尝试自动部署 |
+| `layaDir` | `""` | `dsh-router-laya` 所在目录 |
+| `startupWaitMs` | `3000` | 启动时等待本地服务就绪的上限 |
+| `startWaitMs` | `90000` | 拉起后等待模型加载就绪的上限 |
+| `provisionWaitMs` | `5000` | 部署脚本执行后等待就绪的上限 |
+| `modelInfoTtlMs` | `60000` | 模型强度信息的缓存有效期（毫秒） |
 
-保存写回 profile 的 `cordis.patch.yml`。`enabled`、`mode`、`judgeSource`、`judgeUrl`、`notify`、`tiers`、`jevUrl`、`jevModel`、`jevApiKeyEnv`、`jevConfidence`、`judgeTimeoutMs`、`legacyOwned` 改完即时生效，其余字段下次重启生效。
-
-`servicePython`、`serviceScript`、`serviceModel` 写在 profile 的 `cordis.patch.yml` 里，设置页没有对应输入框，改完下次重启 DSH 生效。切换 `judgeSource` 不用重启：切到「本地」后的第一条消息就会把服务拉起来。
+修改 `enabled`、`mode`、`judgeSource`、`judgeUrl`、`notify`、`tiers`、`jevUrl`、`jevModel`、`jevApiKeyEnv`、`jevConfidence`、`judgeTimeoutMs` 即时生效。路径及服务拉起相关参数改动后需重启 DSH 生效。
 
 </details>
 
+## HTTP 接口
+
 <details>
-<summary>HTTP 接口</summary>
+<summary>展开 HTTP 接口</summary>
 
-路径都带 `/router-effort/*` 旧别名，下表只列新路径。端口用当前 GUI 的端口。
+插件注册 9 条 HTTP 路由（同时兼容 `/router-effort/*` 别名路径）：
 
-| 路径 | 方法 | 作用 |
-| --- | --- | --- |
-| `/effort-router/judge` | GET | 判定后端状态：`{backend, state, detail, judgeUrl}`，local 时另带 `setupLog`，jev 时另带 `jevModel` |
-| `/effort-router/config` | GET / POST | 读配置、写配置 |
-| `/effort-router/mode` | GET / POST | 读当前模式、切自动或手动 |
-| `/effort-router/models` | GET | 查看某个模型解析到的强度与落点 |
-| `/effort-router/last` | GET | 芯片的数据源，按会话返回最近一次判定 |
-| `/effort-router/seen` | GET / HEAD | 前端报到，记录会话与组件参数 |
-| `/effort-router/probe` | POST | 设置页「测试」按钮的后端 |
-| `/effort-router/key` | GET / POST | 查 Jev Key 状态、写入 Key |
-| `/effort-router/open-credentials` | POST | 用系统默认程序打开 `.credentials.yaml` |
+| 接口路径 | 请求方法 | 功能说明 |
+| :--- | :--- | :--- |
+| `/effort-router/judge` | GET | 查询判定后端状态（`backend`、`state`、`detail`、`judgeUrl`） |
+| `/effort-router/config` | GET / POST | 读取或更新插件配置 |
+| `/effort-router/mode` | GET / POST | 读取或切换运行模式（`auto` / `manual`） |
+| `/effort-router/models` | GET | 解析目标模型声明的强度列表与落位结果 |
+| `/effort-router/last` | GET | 读取指定会话最近一次判定结果 |
+| `/effort-router/seen` | GET / HEAD | 前端组件状态报到 |
+| `/effort-router/probe` | POST | 触发后端连接与判定探活测试 |
+| `/effort-router/key` | GET / POST | 查询或保存 Jev API Key 状态 |
+| `/effort-router/open-credentials` | POST | 调用系统默认程序打开凭据文件 `.credentials.yaml` |
 
-`POST` 一律要求 `Content-Type: application/json`。
+POST 请求需携带 Header `Content-Type: application/json`。
+
+调用示例：
 
 ```bash
-curl "http://127.0.0.1:<GUI 端口>/effort-router/models?provider=<provider>&model=<model>&tier=max"
-# {"efforts":["low","medium","high"],"tier":"max","picked":"high","ttlMs":60000}
-curl "http://127.0.0.1:<GUI 端口>/effort-router/judge"
-# {"backend":"jev","state":"up","detail":"","judgeUrl":"https://tokenflux.dev/v1/systemone","jevModel":"jev-latest"}
+# 查询当前判定服务状态
+curl "http://127.0.0.1:<GUI端口>/effort-router/judge"
+
+# 测试特定模型在 max 档位下的落点
+curl "http://127.0.0.1:<GUI端口>/effort-router/models?provider=<provider>&model=<model>&tier=max"
 ```
 
 </details>
 
 ## 已知限制
 
-- 判定服务（local）的请求与响应格式写死，换别的判定服务要改代码。
-- 本地判定对长文本更慢：400 字以上 12 到 13 秒，超出 6000ms 预算就落兜底档。
-- 本地判定的档位跟内容强相关，同一段文字截短会从 `low` 跳到 `max`，所以插件发全文。
-- 本地判定在 CPU 上是秒级：p50 2.5 秒，首 token 就晚这么多。要更快的判定就用 Jev 后端。
-- `provision` 走的上游 `setup.mjs` 会在建 venv 时抛 `TypeError: probe.base is not iterable`，自动部署这条路暂时不通，按「判定服务」一节手工备好 venv 与权重再用三个路径字段接管。
-- 服务被别处占着端口时，插件拉起的那个会在 `bind()` 里失败退出，状态仍会显示 `up`（占着端口那个能答话）。
-- 判定服务的生死跟着 DSH 走。想让它离开 DSH 继续跑（比如几个实例共用一份判定服务），就得自己起服务并把 `autoStart` 设为 `false`。
-- 强度排序按名字：`off` < `minimal` < `low` < `medium` < `high` < `xhigh` < `max`。厂商出现新词时要补进代码，否则那个强度会被跳过。
-- 一轮只判一次，中途追加的长任务不会重新判。
-- 子代理不单独判定，强度跟主代理走。
-- 判定在请求前跑完，首 token 会晚一次判定的时间：Jev 通常 1 秒上下（预算 3000ms），本地服务 2 到 7 秒（预算 6000ms）。
-- 模型选择器里的「推理等级」会跟着判定跳，这份选择就是请求的来源。你手动改过的等级作为下限，插件只往上取，不会降到它下面。
-- 每轮判定都会 append 一条 `model/selection`，值不变时宿主会短路，实际增量很小。
-- `last.json` 的记录从 0.4.1 起是 `schemaVersion: 2`。更早的记录在加载时迁移：缺 `baseline` 的按「插件自己写的」处理，由 `legacyOwned` 控制。
-- 目前只在 Windows 上验证过。
-- 改了 `client.js` 要刷新窗口才看得到，宿主侧改动要重启 DSH。
+- **首 Token 延迟影响**：判定在唤醒阶段同步等待，执行耗时会计入首 Token 延迟。Jev 约 1 秒，本地模型 CPU 推理约 2 到 7 秒，超时自动回退兜底档位。
+- **单轮单次判定**：判定仅在用户发送消息时执行一次，单轮中后续的工具调用与多步输出不重复判定。
+- **子代理继承**：子代理不单独触发判定，直接继承主代理的思考强度。
+- **强度词典依赖**：落位依据内置词表排序（`off` < `minimal` < `low` < `medium` < `high` < `xhigh` < `max`），未收录的新词档位会被忽略。
+- **平台验证**：当前版本主要在 Windows 环境完成验证。
 
-## 开发
+## 开发者指南
+
+### 测试与检查
 
 ```bash
-npm test             # 16 个测试文件，不联网
-npm run test:cordis  # 在真 cordis 上下文里跑挂载与事件，找不到 DSH 安装目录时跳过
-npm run test:coverage # 先跑 npm test，再出覆盖率；行覆盖低于 85% 退出码非 0
-npm run lint         # eslint，与 CI 同一条命令
+npm test              # 运行 16 个测试套件（离线运行）
+npm run test:cordis   # 在真实 Cordis 上下文中验证挂载与事件
+npm run test:coverage # 代码覆盖率检查（行覆盖率阈值 85%）
+npm run lint          # 执行 ESLint 静态代码检查
 ```
 
-测试不读 `node_modules`，克隆下来直接跑 `npm test` 就行。`@deepseek-ai/schemastery` 由 profile 提供；`npm install` 会装上 `dsh-router-laya`，部署判定服务时用它。CI 跑 Node 20、22、24，每一步都过 lint 与覆盖率门槛。
-
-格式由 `.prettierrc.json` 描述（无分号、单引号、行宽 160）。整仓还没按它重排过，所以 `prettier --check` 暂时不进 CI；改到哪个文件就用 `npx prettier --write <文件>` 对齐。
+### 工程目录结构
 
 ```
 .
-├── index.js           宿主侧入口：判定、落位、落盘、服务生命周期、事件接线
-├── effort.mjs         强度词汇，以及「判定档位 → 模型强度」的落位规则
-├── config/
-│   ├── settings.mjs   配置项的名字与默认值、本轮配置的合成
-│   └── validate.mjs   设置页补丁的校验
-├── http/
-│   ├── routes.mjs     九条插件路由
-│   └── respond.mjs    写响应、读 JSON 请求体、同源检查
-├── client.js          前端：设置页与输入框芯片
-├── supervisor.mjs     判定服务的看门人，随 DSH 退出
-├── assets/            README 用的 banner
-├── locale/            插件列表里的标题与描述
-├── test/              单元测试，不依赖网络；fake-host.mjs 是 0.2.2 时序的测试替身
-└── cordis.patch.yml   默认挂载行
+├── index.js           # 宿主入口：生命周期、事件接线、判定与落位调度
+├── effort.mjs         # 强度词典与位置自适应落位算法
+├── config/            # 配置管理模块
+│   ├── settings.mjs   # 配置项定义、默认值与单轮运行时配置合成
+│   └── validate.mjs   # 配置校验逻辑
+├── http/              # HTTP 接口层
+│   ├── routes.mjs     # 9 条插件 HTTP 路由注册
+│   └── respond.mjs    # 响应封装、请求体解析与同源校验
+├── client.js          # 前端交互：输入框状态芯片与设置面板组件
+├── supervisor.mjs     # 本地 Python 判定服务看管守护进程
+├── assets/            # 静态资源（含 banner.svg）
+├── locale/            # 多语言配置（中英双语）
+└── test/              # 单元测试与测试桩
 ```
 
 ## 许可证
 
-MIT，见 [LICENSE](LICENSE)。
+本项目采用 [MIT](LICENSE) 许可证。
